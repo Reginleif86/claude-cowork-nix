@@ -264,6 +264,25 @@
               fi
               echo "[patch:12] Done"
 
+              # --- Patch 13: Wire CLAUDE_CODE_LOCAL_BINARY in CCD constructor ---
+              # The bundler tree-shook the constructor's
+              #   `process.env.CLAUDE_CODE_LOCAL_BINARY && (this.localBinaryInitPromise = this.initLocalBinary(...))`
+              # into a dead expression statement. Without that assignment,
+              # `getLocalBinaryPath()` returns undefined, so `prepare()`'s
+              # short-circuit (`if(A)return{ready:!0,path:A}`) never fires and
+              # control falls into `getHostTarget()`/`getHostPlatform()`, which
+              # throws "Unsupported platform: linux-x64". All the LOCAL-mode
+              # machinery — initLocalBinary, getLocalBinaryPath, prepare's
+              # short-circuit — is intact and works correctly the moment
+              # localBinaryPath gets set. So we just restore the assignment.
+              echo "[patch:13] Wiring CLAUDE_CODE_LOCAL_BINARY in CCD constructor..."
+              grep -qP 'process\.env\.CLAUDE_CODE_LOCAL_BINARY\}async initLocalBinary' "$INDEX" \
+                || { echo "ERROR: patch 13 target (orphan env-var statement) not found (pre-check)"; exit 1; }
+              perl -i -pe 's{process\.env\.CLAUDE_CODE_LOCAL_BINARY\}}{process.env.CLAUDE_CODE_LOCAL_BINARY\&\&(this.localBinaryInitPromise=this.initLocalBinary(process.env.CLAUDE_CODE_LOCAL_BINARY))\}}g' "$INDEX"
+              grep -qP 'this\.localBinaryInitPromise=this\.initLocalBinary\(process\.env\.CLAUDE_CODE_LOCAL_BINARY\)' "$INDEX" \
+                || { echo "ERROR: patch 13 (CCD constructor wiring) failed to apply"; exit 1; }
+              echo "[patch:13] Done"
+
               # Repack ASAR
               echo "[5/6] Repacking ASAR..."
               ${asarTool}/bin/asar-tool pack extracted app.asar
