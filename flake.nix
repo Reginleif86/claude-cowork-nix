@@ -278,7 +278,7 @@
               echo "[patch:13] Wiring CLAUDE_CODE_LOCAL_BINARY in CCD constructor..."
               grep -qP 'process\.env\.CLAUDE_CODE_LOCAL_BINARY\}async initLocalBinary' "$INDEX" \
                 || { echo "ERROR: patch 13 target (orphan env-var statement) not found (pre-check)"; exit 1; }
-              perl -i -pe 's{process\.env\.CLAUDE_CODE_LOCAL_BINARY\}}{process.env.CLAUDE_CODE_LOCAL_BINARY\&\&(this.localBinaryInitPromise=this.initLocalBinary(process.env.CLAUDE_CODE_LOCAL_BINARY))\}}g' "$INDEX"
+              perl -i -pe 's{(process\.env\.CLAUDE_CODE_LOCAL_BINARY)\}(?=async initLocalBinary)}{$1\&\&(this.localBinaryInitPromise=this.initLocalBinary($1))\}}g' "$INDEX"
               grep -qP 'this\.localBinaryInitPromise=this\.initLocalBinary\(process\.env\.CLAUDE_CODE_LOCAL_BINARY\)' "$INDEX" \
                 || { echo "ERROR: patch 13 (CCD constructor wiring) failed to apply"; exit 1; }
               echo "[patch:13] Done"
