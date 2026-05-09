@@ -359,7 +359,12 @@
 
           # FHS wrapper for maximum compatibility (cowork + MCP) — parameterized
           # on claudeCodePackage, threaded through to the inner wrapper.
-          mkClaudeDesktopFHS = claudeCodePackage: pkgs.buildFHSEnv {
+          mkClaudeDesktopFHS =
+            claudeCodePackage:
+            let
+              inner = mkClaudeDesktop claudeCodePackage;
+            in
+            pkgs.buildFHSEnv {
             name = "claude-desktop";
             targetPkgs = pkgs: with pkgs; [
               bubblewrap
@@ -378,7 +383,7 @@
               curl
               wget
             ];
-            runScript = "${mkClaudeDesktop claudeCodePackage}/bin/claude-desktop";
+            runScript = "${inner}/bin/claude-desktop";
             # Bind /tmp/sessions -> /sessions so Cowork VM-internal paths resolve
             extraPreBwrapCmds = ''
               mkdir -p /tmp/sessions
@@ -386,6 +391,15 @@
             extraBwrapArgs = [
               "--symlink" "/tmp/sessions" "/sessions"
             ];
+            # buildFHSEnv only installs the FHS-wrapped bin; pull icons from the
+            # inner so GNOME / app-launchers can resolve `Icon=claude` to a real
+            # PNG. Don't propagate share/applications because the inner's
+            # .desktop points at its own non-FHS bin; HM users provide their own
+            # desktop entry, and standalone users run the bin directly.
+            extraInstallCommands = ''
+              mkdir -p $out/share
+              ln -s ${inner}/share/icons $out/share/icons
+            '';
             meta = with pkgs.lib; {
               description = "Claude Desktop for Linux (FHS) with Cowork and MCP support";
               homepage = "https://claude.ai";
