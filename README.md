@@ -3,7 +3,7 @@
 [![Nix Flake](https://img.shields.io/badge/Nix-Flake-5277C3?logo=nixos&logoColor=white)](https://github.com/Reginleif88/claude-cowork-nix)
 [![Platform](https://img.shields.io/badge/Platform-Linux-blue?logo=linux&logoColor=white)](https://github.com/Reginleif88/claude-cowork-nix)
 [![License](https://img.shields.io/badge/License-Apache--2.0%20OR%20MIT-blue)](./LICENSE-APACHE)
-[![Claude Desktop](https://img.shields.io/badge/Claude_Desktop-v1.3109.0-d97757)](https://claude.ai)
+[![Claude Desktop](https://img.shields.io/badge/Claude_Desktop-v1.6608.2-d97757)](https://claude.ai)
 [![Cowork](https://img.shields.io/badge/Cowork-Enabled-green)](./COWORK_PROGRESS.md)
 
 Fully declarative NixOS package for Claude Desktop on Linux with Cowork support. Extracts from the macOS DMG, patches for Linux compatibility, and wraps with Electron 41.
@@ -265,12 +265,27 @@ nix run . 2>&1 | grep -E "Cowork|error"
 
 ### Updating to New Versions
 
-Patches use `perl -pe` regex with `\w+` wildcards for minified identifiers, so version bumps should not require patch changes.
+A daily GitHub Actions workflow (`.github/workflows/auto-update.yml`) discovers the latest DMG via Anthropic's CDN `RELEASES.json`, prefetches the SRI hash, opens a PR, and verifies the build. Most version bumps land cleanly through CI because patches anchor on `\w+`/`[\w$]+` wildcards over minified identifiers and stable English log strings.
 
-1. Get the new DMG URL from `https://claude.ai/download` (inspect the download link in browser dev tools)
-2. Update `claudeVersion`, `claudeDmgUrl`, and `claudeDmgHash` in `flake.nix` (use `nix-prefetch-url <url>` then `nix hash convert --hash-algo sha256 --to sri <hash>`)
-3. Build: `nix build .` -- if it succeeds, patches are still valid
-4. If build fails: check the `grep -qP` verification errors to see which regex needs updating
+To update manually (e.g. before the daily cron fires):
+
+1. Resolve the latest version + DMG URL:
+
+   ```bash
+   curl -s https://downloads.claude.ai/releases/darwin/universal/RELEASES.json \
+     | jq -r '"\(.currentRelease)\t\(.releases[0].updateTo.url | sub("\\.zip$"; ".dmg"))"'
+   ```
+
+2. Prefetch the hash and update `flake.nix`:
+
+   ```bash
+   nix_hash=$(nix-prefetch-url --type sha256 "<DMG_URL>")
+   nix hash convert --hash-algo sha256 --to sri "$nix_hash"
+   ```
+
+   Then update `claudeVersion`, `claudeDmgUrl`, and `claudeDmgHash`.
+3. Build: `nix build .` — if it succeeds, all patches still apply.
+4. If build fails: the `grep -qP` verification line (or the dynamic patch-05 script's error) names the patch whose regex needs widening. Check `docs/patching-architecture.md` for context. Past breakages have come from Anthropic adding intermediate code inside an anchored function body — typically fixed by relaxing one regex to allow a lazy `.{0,N}?` gap.
 
 ## Troubleshooting
 
