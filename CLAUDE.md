@@ -54,6 +54,8 @@ See `docs/patching-architecture.md` for the full technical analysis.
 | 09 | `perl -pe` regex | DBus tray cleanup delay for stability |
 | 11 | `perl -pe` regex | Resolve `shellPathWorker.js` from Claude's asar (not Electron runtime's) |
 | 12 | `perl -pe` regex | Neutralize `[1m]` model-suffix feature flag (GrowthBook `3885610113`) — unblocks Code/LOCAL send button |
+| 13 | `perl -pe` regex | `getHostPlatform()` returns `linux-x64`/`linux-arm64` instead of throwing — fixes Cowork chat error in v1.6608.x |
+| 14 | `perl -pe` regex | Restore constructor's `CLAUDE_CODE_LOCAL_BINARY` → `initLocalBinary` wiring (minified into a dead expression in v1.6608.2) |
 
 ## Electron Gotchas
 

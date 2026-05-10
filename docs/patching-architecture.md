@@ -74,11 +74,17 @@ function zxt(t) { return t }
 
 Both call sites (`model: zxt(r.model || "default")` at session start, and `const i = zxt(r)` in `setModel`) are preserved; only the function body is neutralized.
 
-## CCD's `CLAUDE_CODE_LOCAL_BINARY` escape hatch
+## CCD's `CLAUDE_CODE_LOCAL_BINARY` escape hatch (patches 13 + 14)
 
-Patch 12 alone isn't sufficient for LOCAL mode — the CCD daemon also throws `Unsupported platform: linux-x64` from `getHostPlatform` when preparing to download its own binary. Anthropic provides an undocumented escape hatch: setting `process.env.CLAUDE_CODE_LOCAL_BINARY` to a valid executable path causes the CCD constructor to short-circuit *every* entry point (`getStatus`, `prepare`, `getBinaryPathIfReady`, `prepareForVM`) **before** `getHostPlatform` is reached.
+Patch 12 alone isn't sufficient for LOCAL mode — the CCD daemon also throws `Unsupported platform: linux-x64` from `getHostPlatform` when preparing to download its own binary. Anthropic originally provided an undocumented escape hatch: setting `process.env.CLAUDE_CODE_LOCAL_BINARY` to a valid executable path caused the CCD constructor to short-circuit *every* entry point (`getStatus`, `prepare`, `getBinaryPathIfReady`, `prepareForVM`) **before** `getHostPlatform` is reached. The module options `programs.claude-desktop.claudeCodePackage` (NixOS + Home Manager) wire this via `makeWrapper --set-default`, so the user's external `CLAUDE_CODE_LOCAL_BINARY` (if any) still wins.
 
-The module options `programs.claude-desktop.claudeCodePackage` (NixOS + Home Manager) wire this via `makeWrapper --set-default`, so the user's external `CLAUDE_CODE_LOCAL_BINARY` (if any) still wins. No ASAR patch is required for the escape hatch — just the env var.
+**Two regressions in v1.6608.2 broke this** and forced two new ASAR patches:
+
+1. **Constructor bridge degraded to a dead expression.** v1.3883's constructor ended with `r=process.env.CLAUDE_CODE_LOCAL_BINARY; r && (this.localBinaryInitPromise = this.initLocalBinary(r))`. v1.6608.2 minified that down to a bare `process.env.CLAUDE_CODE_LOCAL_BINARY` standalone expression (no assignment, no call), so `localBinaryPath` stays `null` regardless of env-var contents and every CCD entry point falls through to `getHostTarget()` → `getHostPlatform()` → throw. **Patch 14** restores the original wiring.
+
+2. **New chat-send call sites await `Ta.prepare()`.** v1.6608.2 added code paths around offsets 10478043 (`const De=await Ta.prepare(); be=(De.ready?De.path:null)??await Ta.getBinaryPathIfReady()`) and 11476159 (`const i=await Ta.getBinaryPathIfReady(); if(!i)throw...`) that propagate the synchronous `getHostPlatform` throw into the chat UI. This surfaces in **Cowork** even when `claudeCodePackage` is unset, because Cowork's send pipeline now opportunistically probes for a host claude-code binary. **Patch 13** is the defensive fix: instead of throwing, `getHostPlatform()` returns the appropriate `linux-x64` / `linux-arm64` string. `getHostTarget()` then resolves cleanly, `binaryExistsForTarget` returns false (no binary on disk), and callers handle the null fallback gracefully.
+
+Together, patch 13 keeps Cowork (and any non-LOCAL feature that incidentally probes CCD) functional with no env var; patch 14 reactivates the LOCAL escape hatch for users who opt in via `claudeCodePackage`.
 
 ## Wrapped-Electron Path Resolution Gotcha
 

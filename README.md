@@ -89,6 +89,8 @@ The in-app "Code" section has four sub-modes (LOCAL, SSH, Cloud Environment, Rem
 
 Anthropic's CCD daemon has an undocumented escape hatch: if `CLAUDE_CODE_LOCAL_BINARY` is set to a valid executable path, *every* CCD entry point (`getStatus`, `prepare`, `getBinaryPathIfReady`, `prepareForVM`) short-circuits before the `getHostPlatform` throw. The `claudeCodePackage` option wires this env var into the Electron wrapper at build time.
 
+In v1.6608.2 Anthropic minified the constructor's env-var bridge into a dead expression, breaking the escape hatch on disk. **Patch 14** restores the original constructor wiring (`process.env.CLAUDE_CODE_LOCAL_BINARY && (this.localBinaryInitPromise = this.initLocalBinary(env))`), so `claudeCodePackage` works again. **Patch 13** is a defensive belt-and-braces fix: it makes `getHostPlatform()` return `linux-x64`/`linux-arm64` instead of throwing — needed because v1.6608.2 also added new send-pipeline call sites that `await Ta.prepare()` from Cowork chats, which would otherwise crash with "Something went wrong / Unsupported platform: linux-x64" even when `claudeCodePackage` is unset.
+
 Patch 12 additionally neutralizes an Anthropic GrowthBook feature flag (`3885610113`) that would otherwise append `[1m]` to Opus/Sonnet model IDs, causing `model_configs/claude-opus-4-6[1m]` 404s that disable the send button. Patch 12 applies unconditionally — you get the fix whether or not you opt into LOCAL mode.
 
 ### Three ways to provide a claude-code binary
@@ -191,12 +193,12 @@ The Claude Code section in the left sidebar has four sub-modes. Status on Linux:
 
 | Mode | Status | Notes |
 |------|--------|-------|
-| **LOCAL** (spawn Claude Code on this machine) | ✅ Works (opt-in) | Set `programs.claude-desktop.claudeCodePackage = pkgs.claude-code;` (or point at any compatible claude-code derivation). This wires `CLAUDE_CODE_LOCAL_BINARY`, which the CCD daemon detects and uses to short-circuit the `getHostPlatform` throw. Patch 12 additionally neutralizes a GrowthBook feature flag (`3885610113`) that would otherwise 404 model config requests and disable the send button. |
+| **LOCAL** (spawn Claude Code on this machine) | ✅ Works (opt-in) | Set `programs.claude-desktop.claudeCodePackage = pkgs.claude-code;` (or point at any compatible claude-code derivation). This wires `CLAUDE_CODE_LOCAL_BINARY`, which the CCD daemon detects and uses to short-circuit the `getHostPlatform` throw. Patch 14 restores the constructor's env-var bridge that v1.6608.2 minified away; patch 12 neutralizes a GrowthBook feature flag (`3885610113`) that would otherwise 404 model config requests and disable the send button. |
 | **SSH** (run Claude Code on a remote host via SSH) | ✅ Works | Bypasses local CCD; the web UI talks directly to the remote. |
 | **Cloud Environment** (Anthropic-managed) | ✅ Works | Same as SSH — bypasses local platform gates. |
 | **Remote Control** | ✅ Works | Same as SSH. |
 
-**Without `claudeCodePackage` set**, LOCAL mode remains unavailable (CCD falls back to its built-in download path which throws on Linux), but SSH / Cloud / Remote Control still work. Cowork chats remain a fully-featured alternative: same agent capabilities through the older local-agent IPC path. See [COWORK_PROGRESS.md](./COWORK_PROGRESS.md) for the full investigation and design notes.
+**Without `claudeCodePackage` set**, LOCAL mode remains unavailable (CCD has no binary to use), but SSH / Cloud / Remote Control still work. Cowork chats remain a fully-featured alternative: same agent capabilities through the older local-agent IPC path. Patch 13 ensures Cowork itself is unaffected by the CCD `getHostPlatform` throw that v1.6608.2 added to the chat send pipeline. See [COWORK_PROGRESS.md](./COWORK_PROGRESS.md) for the full investigation and design notes.
 
 **Auth caveat**: the Electron-spawned `claude-code` inherits only the desktop app's env, not your shell's. If you rely on a shell-level auth wrapper (e.g. `claude-provider --env` toggling between Anthropic and a provider), LOCAL mode will silently use whatever auth is stored in `~/.claude/` (typically your Claude Desktop sign-in). For provider toggling, point `claudeCodePackage` at a thin wrapper script that sources your provider env before `exec`-ing the real binary, or leave it unset and use Cowork chats.
 
@@ -209,7 +211,7 @@ macOS DMG (fetchurl)
        |
   asar_tool.py extract -> raw JS
        |
-  12 patches:
+  14 patches:
     00: Native module stub (@ant/claude-native + AuthRequest)
     01: Cowork module loader (claude-cowork-linux)
     02: Platform flag (route Linux through TypeScript VM path)
@@ -222,6 +224,8 @@ macOS DMG (fetchurl)
     09: DBus tray cleanup delay (stability fix)
     11: shellPathWorker resolution (use process.argv[1], not resourcesPath)
     12: [1m] model-suffix neutralization (unblocks Code/LOCAL send button)
+    13: getHostPlatform Linux return (stops "Unsupported platform: linux-x64" throw)
+    14: CLAUDE_CODE_LOCAL_BINARY constructor wiring (restored in v1.6608.x)
        |
   asar_tool.py pack -> patched app.asar
        |

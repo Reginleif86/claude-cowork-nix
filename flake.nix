@@ -264,6 +264,34 @@
               fi
               echo "[patch:12] Done"
 
+              # --- Patch 13: getHostPlatform Linux return (regex) ---
+              # v1.6608.2 added new send-pipeline call sites that await Ta.prepare()
+              # and Ta.getBinaryPathIfReady(). Both fall through to getHostPlatform(),
+              # which throws `Unsupported platform: linux-x64` and surfaces in the chat
+              # UI as "Something went wrong" — including in Cowork. Inject a Linux
+              # return clause so getHostTarget() resolves to a valid (downloadless)
+              # platform; CCD then returns {ready:!1} cleanly instead of throwing.
+              # Local variable name is captured and back-referenced (\2) to keep the
+              # regex anchored on the original three-branch shape.
+              echo "[patch:13] Patching getHostPlatform Linux return..."
+              perl -i -pe 's{(getHostPlatform\(\)\{const (\w+)=process\.arch;if\(process\.platform==="darwin"\)return \2==="arm64"\?"darwin-arm64":"darwin-x64";if\(process\.platform==="win32"\)return \2==="arm64"\?"win32-arm64":"win32-x64";)(throw new Error\(`Unsupported platform:)}{$1if(process.platform==="linux")return $2==="arm64"?"linux-arm64":"linux-x64";$3}g' "$INDEX"
+              grep -qP 'if\(process\.platform==="linux"\)return \w+==="arm64"\?"linux-arm64":"linux-x64";throw new Error\(`Unsupported platform:' "$INDEX" \
+                || { echo "ERROR: patch 13 (getHostPlatform Linux return) failed to apply"; exit 1; }
+              echo "[patch:13] Done"
+
+              # --- Patch 14: CLAUDE_CODE_LOCAL_BINARY constructor wiring (regex) ---
+              # v1.6608.2 minified the env-var bridge into a dead expression
+              # (`process.env.CLAUDE_CODE_LOCAL_BINARY` standalone, no assignment).
+              # Restore the v1.3883 behaviour: when the env var is set, call
+              # initLocalBinary(env) and store the promise so getLocalBinaryPath()
+              # short-circuits CCD entry points before they hit getHostTarget().
+              # This is what makes claudeCodePackage / Code-LOCAL functional again.
+              echo "[patch:14] Restoring CLAUDE_CODE_LOCAL_BINARY constructor wiring..."
+              perl -i -pe 's{process\.env\.CLAUDE_CODE_LOCAL_BINARY\}async initLocalBinary}{process.env.CLAUDE_CODE_LOCAL_BINARY\&\&(this.localBinaryInitPromise=this.initLocalBinary(process.env.CLAUDE_CODE_LOCAL_BINARY))\}async initLocalBinary}g' "$INDEX"
+              grep -qP 'this\.localBinaryInitPromise=this\.initLocalBinary\(process\.env\.CLAUDE_CODE_LOCAL_BINARY\)' "$INDEX" \
+                || { echo "ERROR: patch 14 (CLAUDE_CODE_LOCAL_BINARY wiring) failed to apply"; exit 1; }
+              echo "[patch:14] Done"
+
               # Repack ASAR
               echo "[5/6] Repacking ASAR..."
               ${asarTool}/bin/asar-tool pack extracted app.asar
