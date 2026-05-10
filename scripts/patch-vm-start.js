@@ -19,8 +19,12 @@ console.log('=== Dynamic Patch: VM Start Intercept ===\n');
 let content = fs.readFileSync(INDEX_JS_PATH, 'utf8');
 
 // Discover function signature by matching the stable pattern:
-// async function WORD(WORD,WORD,WORD,WORD){var WORD,...;const WORD=WORD(),...WORD=WORD();WORD.info(`[VM:start]
-const sigRegex = /async function (\w+)\((\w+),(\w+),(\w+),(\w+)\)\{(var \w+(?:,\w+)*;const \w+=\w+\(\),\w+=Date\.now\(\),\w+=new \w+,\w+=\w+\(\);(?:if\()?(?:\w+\(\),)*\w+\.info\(`\[VM:start\])/;
+//   async function WORD(WORD,WORD,WORD,WORD){var WORD,...; <arbitrary setup>; WORD.info(`[VM:start]
+// The arbitrary-setup window covers version-to-version drift such as the
+// condadata.* / operon-* cleanup loops added in v1.6608.x. The capture is
+// anchored on the function header + var declarations + first [VM:start] log
+// call, which together produce a unique substring suitable for `replace()`.
+const sigRegex = /async function (\w+)\((\w+),(\w+),(\w+),(\w+)\)\{(var \w+(?:,\w+)*;.{0,4000}?\w+\.info\(`\[VM:start\])/;
 const sigMatch = content.match(sigRegex);
 
 if (!sigMatch) {
