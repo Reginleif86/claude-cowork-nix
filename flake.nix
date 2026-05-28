@@ -9,9 +9,9 @@
   outputs = { self, nixpkgs, flake-utils }:
     let
       # Claude Desktop version and source
-      claudeVersion = "1.7196.0";
-      claudeDmgHash = "sha256-0rkOjeJ7DFFYPTE8kh4lQTlbLCSSjOqEWy5ZuRy8yBQ=";
-      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/1.7196.0/Claude-2dbd7802ab037cbb97d77be1a063241009b5e598.dmg";
+      claudeVersion = "1.9255.2";
+      claudeDmgHash = "sha256-zRJv0nGvnQVLo7nOJYIG4tz6rfxJr9VARGpSLCeASCE=";
+      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/1.9255.2/Claude-1dc8f7b0f46a151e8522f24f6656aab10182bf92.dmg";
 
       supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
 
@@ -203,7 +203,7 @@
               # --- Patch 06b: Platform getter (regex) ---
               # Don't return null for Linux in platform-gated getter
               echo "[patch:06b] Patching platform getter..."
-              perl -i -pe 's{(async function \w+\(\)\{return )process\.platform!=="darwin"\?null(:await \w+\(\))}{''${1}process.platform!=="darwin"\&\&process.platform!=="linux"?null''${2}}g' "$INDEX"
+              perl -i -pe 's{(async function [\w\$]+\(\)\{return )process\.platform!=="darwin"\?null(:await \w+\(\))}{''${1}process.platform!=="darwin"\&\&process.platform!=="linux"?null''${2}}g' "$INDEX"
               grep -qP 'process\.platform!=="darwin"&&process\.platform!=="linux"\?null' "$INDEX" \
                 || { echo "ERROR: patch 06b (platform getter) failed to apply"; exit 1; }
               echo "[patch:06b] Done"
@@ -247,18 +247,17 @@
               echo "[patch:11] Done"
 
               # --- Patch 12: Neutralize [1m] model-suffix feature flag (regex) ---
-              # Anthropic's GrowthBook flag 3885610113 appends "[1m]" to opus-4-6/sonnet-4-6
-              # model ids, which 404s on /api/.../model_configs/claude-opus-4-6[1m] and
-              # cascades into undefined.includes() in the renderer, disabling the Code
-              # section's LOCAL-mode send button. Replace the suffix function body with
-              # a pass-through so model ids are returned unchanged.
-              # Parameter name varies across versions (t, e, ...) — use \w+ and
-              # match the body loosely between the [1m] test and the template literal.
+              # Anthropic appends "[1m]" to selected model ids. In older builds
+              # this was gated by GrowthBook flag 3885610113; in v1.9255.x it is
+              # based on the discovered inference model list. Either way, the
+              # suffixed model config request 404s and disables Code/LOCAL sends.
+              # Replace the suffix function body with a pass-through.
+              # Names vary across versions and may contain `$`.
               echo "[patch:12] Neutralizing [1m] model-suffix feature flag..."
-              grep -qP 'function \w+\(\w+\)\{return/\\\[1m\\\]/i\.test' "$INDEX" \
+              grep -qP 'function [\w\$]+\([\w\$]+\)\{return/\\\[1m\\\]/i\.test' "$INDEX" \
                 || { echo "ERROR: patch 12 target function not found (pre-check)"; exit 1; }
-              perl -i -pe 's{function (\w+)\((\w+)\)\{return/\\\[1m\\\]/i\.test\(\2\)\|\|!\w+\("3885610113"\)\|\|.+?\?\2:`\$\{\2\}\[1m\]`\}}{function $1($2){return $2}}g' "$INDEX"
-              if grep -qP 'function \w+\(\w+\)\{return/\\\[1m\\\]/i\.test' "$INDEX"; then
+              perl -i -pe 's{function ([\w\$]+)\(([\w\$]+)\)\{return/\\\[1m\\\]/i\.test\(\2\)\|\|.+?\?\2:`\$\{\2\}\[1m\]`\}}{function $1($2){return $2}}g' "$INDEX"
+              if grep -qP 'function [\w\$]+\([\w\$]+\)\{return/\\\[1m\\\]/i\.test' "$INDEX"; then
                 echo "ERROR: patch 12 ([1m] suffix) did not neutralize target"
                 exit 1
               fi
@@ -291,6 +290,18 @@
               grep -qP 'this\.localBinaryInitPromise=this\.initLocalBinary\(process\.env\.CLAUDE_CODE_LOCAL_BINARY\)' "$INDEX" \
                 || { echo "ERROR: patch 14 (CLAUDE_CODE_LOCAL_BINARY wiring) failed to apply"; exit 1; }
               echo "[patch:14] Done"
+
+              # --- Patch 15: VM bundle file lookup Linux fallback (regex) ---
+              # v1.9255.x's ClaudeVM.getDownloadStatus calls a helper that reads
+              # `Qo.files[process.platform][arch]`. The VM bundle manifest has no
+              # Linux key, so the handler throws `Cannot read properties of
+              # undefined (reading 'x64')` on startup. Return [] when the platform
+              # entry is absent; Linux already skips VM downloads via patch 04.
+              echo "[patch:15] Patching VM bundle file lookup fallback..."
+              perl -i -pe 's{function ([\w\$]+)\(\)\{const (\w+)=process\.platform,(\w+)=([\w\$]+)\(\);return ([\w\$]+)\.files\[\2\]\[\3\]\?\?\[\]\}}{function $1(){const $2=process.platform,$3=$4();return ($5.files[$2]\&\&$5.files[$2][$3])??[]}}g' "$INDEX"
+              grep -qP 'return \([\w\$]+\.files\[\w+\]&&[\w\$]+\.files\[\w+\]\[\w+\]\)\?\?\[\]' "$INDEX" \
+                || { echo "ERROR: patch 15 (VM bundle file lookup fallback) failed to apply"; exit 1; }
+              echo "[patch:15] Done"
 
               # Repack ASAR
               echo "[5/6] Repacking ASAR..."

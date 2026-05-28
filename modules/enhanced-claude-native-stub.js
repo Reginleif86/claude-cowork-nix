@@ -33,6 +33,11 @@ class ClaudeNativeLinux {
     return "10.0.0";
   }
 
+  getWindowsElevationType() {
+    // Windows-only concept. "default" maps to can_elevate=false upstream.
+    return "default";
+  }
+
   getOSVersion() {
     return os.release();
   }
@@ -224,6 +229,11 @@ class ClaudeNativeLinux {
 
   // File system operations - delegate to Node.js fs module
   // (if the app uses these, they should work fine with standard fs)
+
+  getAppInfoForFile(filePath) {
+    // Linux has no direct equivalent to the native macOS/Windows file-owner lookup.
+    return null;
+  }
 
   // System theme detection
   getSystemTheme() {

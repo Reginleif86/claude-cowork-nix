@@ -4,7 +4,7 @@ Enabling macOS-only Claude Desktop features on Linux via runtime patching.
 
 ## Architecture
 
-- **Source**: macOS DMG fetched via `fetchurl` (currently v1.3109.0 — tracked by github-actions auto-update)
+- **Source**: macOS DMG fetched via `fetchurl` (currently v1.9255.2 — tracked by github-actions auto-update)
 - **Extraction**: `7zz` (native LZFSE support) + `asar_tool.py`
 - **Runtime**: `electron_41` from nixpkgs
 - **Packaging**: Nix flake with `makeWrapper` + `buildFHSEnv`
@@ -56,6 +56,7 @@ See `docs/patching-architecture.md` for the full technical analysis.
 | 12 | `perl -pe` regex | Neutralize `[1m]` model-suffix feature flag (GrowthBook `3885610113`) — unblocks Code/LOCAL send button |
 | 13 | `perl -pe` regex | `getHostPlatform()` returns `linux-x64`/`linux-arm64` instead of throwing — fixes Cowork chat error in v1.6608.x |
 | 14 | `perl -pe` regex | Restore constructor's `CLAUDE_CODE_LOCAL_BINARY` → `initLocalBinary` wiring (minified into a dead expression in v1.6608.2) |
+| 15 | `perl -pe` regex | Make VM bundle file lookup return `[]` on Linux instead of throwing in `ClaudeVM.getDownloadStatus` |
 
 ## Electron Gotchas
 

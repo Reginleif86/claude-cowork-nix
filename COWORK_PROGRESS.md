@@ -1,6 +1,6 @@
 # Cowork on Linux - Progress Report
 
-## Current Status: v1.3109.0 — Cowork + Code/LOCAL Functional
+## Current Status: v1.9255.2 — Cowork + Code/LOCAL Functional
 
 Cowork is running on Linux via a fully declarative Nix flake. Claude Code spawns inside Cowork sessions, processes messages via the SDK wire protocol, streams responses, and persists transcripts across app restarts.
 
@@ -23,16 +23,14 @@ Cowork is running on Linux via a fully declarative Nix flake. Claude Code spawns
 
 - **No bubblewrap sandboxing**: Claude Code runs directly on the host, not inside a sandbox. NixOS paths are incompatible with simple bwrap bind-mounts.
 - **Executable file preview blocked**: `.sh`, `.exe` etc. can't be opened in UI preview — upstream security behavior, not Linux-specific.
-- **Missing native stub functions**: `getAppInfoForFile` and `getWindowsElevationType` cause harmless log errors.
 - **Plugin permission shim**: `cowork-plugin-shim.sh` is now provided in the asar resources. The shim permission bridge starts and mounts `.cowork-lib`, `.cowork-perm-req`, `.cowork-perm-resp` into sessions.
-- **Cosmetic VM download error**: `Cannot read properties of undefined (reading 'x64')` — harmless, download is skipped by patch 04. Status query (`ClaudeVM.getDownloadStatus`) is not stubbed and produces one error per launch.
 - **Find-in-page preload origin error**: Cosmetic — `DesktopIntl` origin allowlist doesn't recognize `file:///nix/store/` paths. Falls back to default English locale; in-app Ctrl+F search may be affected.
 - **`BuddyBleTransport.reportState`**: Bluetooth IPC handler not registered on Linux. Fires once at startup; harmless.
 - **In-app Code section → LOCAL mode** requires opt-in: set `programs.claude-desktop.claudeCodePackage = <claude-code package>` (e.g. `pkgs.claude-code` or `inputs.claude-code.packages.${system}.default`). Without this, the Electron process has no `CLAUDE_CODE_LOCAL_BINARY` set, so CCD falls back to its built-in `getHostPlatform` path which still throws on Linux (producing polling-loop log noise but not crashing the app). The earlier `undefined.includes()` and `model_configs/[1m]` 404 blockers are resolved by patch 12 regardless. **SSH / Cloud Environment / Remote-control modes** continue to work (bypass CCD entirely).
 
 ## Architecture
 
-### Patch Chain (v1.3109.0)
+### Patch Chain (v1.9255.2)
 
 All patches use version-resilient `\w+` (or `[\w\$]+` where minified names contain `$`) regex wildcards for minified identifiers. Function names are discovered at build time, not hardcoded.
 
@@ -50,6 +48,9 @@ All patches use version-resilient `\w+` (or `[\w\$]+` where minified names conta
 | 09 | `perl -pe` regex | DBus tray cleanup delay for stability |
 | 11 | `perl -pe` regex | Resolve `shellPathWorker.js` from Claude's asar (not Electron runtime's) |
 | 12 | `perl -pe` regex | Neutralize `[1m]` model-suffix (GrowthBook flag `3885610113`); unblocks Code/LOCAL send button |
+| 13 | `perl -pe` regex | `getHostPlatform()` returns `linux-x64`/`linux-arm64` instead of throwing |
+| 14 | `perl -pe` regex | Restore constructor's `CLAUDE_CODE_LOCAL_BINARY` → `initLocalBinary` wiring |
+| 15 | `perl -pe` regex | Make VM bundle file lookup return `[]` on Linux instead of throwing in `ClaudeVM.getDownloadStatus` |
 
 ### Session Flow
 
@@ -90,13 +91,11 @@ User sends message in Cowork UI
 
 ## Next Steps
 
-1. Add missing native stub functions (`getAppInfoForFile`, `getWindowsElevationType`)
-2. Investigate bubblewrap sandboxing (requires Nix store bind-mounts)
-3. Stub `ClaudeVM.getDownloadStatus` to silence the once-per-launch cosmetic error
-4. Patch `DesktopIntl` origin allowlist to accept `file:///nix/store/` paths (would fix find-in-page preload + locale init)
-5. Silence CCD polling-loop log noise when `claudeCodePackage` is unset — cheap stub returning `{status: "unsupported"}` from the IPC handler
+1. Investigate bubblewrap sandboxing (requires Nix store bind-mounts)
+2. Patch `DesktopIntl` origin allowlist to accept `file:///nix/store/` paths (would fix find-in-page preload + locale init)
+3. Silence CCD polling-loop log noise when `claudeCodePackage` is unset — cheap stub returning `{status: "unsupported"}` from the IPC handler
 
 ---
 
-**Last Updated**: 2026-04-17
-**Claude Desktop Version**: 1.3109.0
+**Last Updated**: 2026-05-28
+**Claude Desktop Version**: 1.9255.2
