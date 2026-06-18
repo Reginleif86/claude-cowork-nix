@@ -157,6 +157,10 @@ const injection = `async function ${funcName}(${params.join(',')}){
           if(child.stderr)child.stderr.on("data",(d)=>{if(cbs.onStderr)cbs.onStderr(id,d.toString())});
           child.on("exit",(code,sig)=>{_procs.delete(id);if(cbs.onExit)cbs.onExit(id,code,sig)});
           child.on("error",(e)=>{console.error("[Cowork Linux] spawn error id="+id+":",e.message);if(cbs.onError)cbs.onError(id,e.message,true)});
+          // v1.13576.4's caller destructures failedMounts from the spawn result, then
+          // calls confirmSpawn(failedMounts). Return an empty list (Linux uses symlink
+          // mounts, which always resolve) so destructuring succeeds and spawn is confirmed.
+          return{failedMounts:[]};
         },
         exec:(command)=>manager.spawnSandboxed(sessionId,'/bin/sh',['-c',command]),
         mkdir:(p)=>{require("fs").mkdirSync(_resolvePath(p),{recursive:true});return Promise.resolve()},

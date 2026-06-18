@@ -67,6 +67,13 @@ class ClaudeNativeLinux {
     return this._mainWindow.isFullScreen();
   }
 
+  // Called unguarded (no optional-chaining on the method) in the stealth-relaunch
+  // path: `(r==null?void 0:r.isOtherAppFullscreen())??!1`. No Linux equivalent of
+  // "is another app fullscreen", so report false.
+  isOtherAppFullscreen() {
+    return false;
+  }
+
   isMinimized() {
     if (!this._mainWindow) return false;
     return this._mainWindow.isMinimized();

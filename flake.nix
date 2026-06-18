@@ -9,9 +9,9 @@
   outputs = { self, nixpkgs, flake-utils }:
     let
       # Claude Desktop version and source
-      claudeVersion = "1.9255.2";
-      claudeDmgHash = "sha256-zRJv0nGvnQVLo7nOJYIG4tz6rfxJr9VARGpSLCeASCE=";
-      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/1.9255.2/Claude-1dc8f7b0f46a151e8522f24f6656aab10182bf92.dmg";
+      claudeVersion = "1.13576.4";
+      claudeDmgHash = "sha256-GNWWWGHJPrpv0NhzUdAFh7eeXSgyrv+ynQuRemHiJ0Q=";
+      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/1.13576.4/Claude-414f858c8545ff8af38af267a1da714429ee98f9.dmg";
 
       supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
 
@@ -39,6 +39,46 @@
             #!${pkgs.python3}/bin/python3
             ${builtins.readFile ./tools/asar_tool.py}
           '';
+
+          # Linux-native node-pty addon (pty.node) for the in-app terminal/shell PTY.
+          # The DMG ships only a macOS Mach-O pty.node, so on Linux node-pty fails to
+          # load ("Cannot find module .../pty.node") and the shell PTY is dead. node-pty
+          # 1.1.0-beta34 uses node-addon-api (N-API, ABI-stable), so a binary built
+          # against electron_41's headers loads in the runtime. spawn-helper is macOS-
+          # only (gyp OS=="mac"; pty.cc execs it under __APPLE__) — Linux forks directly.
+          nodePtyElectron = pkgs.stdenv.mkDerivation {
+            pname = "node-pty-electron";
+            version = "1.1.0-beta34";
+            src = pkgs.fetchurl {
+              url = "https://registry.npmjs.org/node-pty/-/node-pty-1.1.0-beta34.tgz";
+              hash = "sha256-LxvUoachiyWC2M3hxxTDZ6InsdLuKwjLrJ+gM4GdWeQ=";
+            };
+            nodeAddonApi = pkgs.fetchurl {
+              url = "https://registry.npmjs.org/node-addon-api/-/node-addon-api-7.1.1.tgz";
+              hash = "sha256-sQRV0VqXfAzRehyw62eeA9k5+O+NQwLrM+H3jazHH4I=";
+            };
+            nativeBuildInputs = [ pkgs.nodejs pkgs.node-gyp pkgs.python3 pkgs.gnumake pkgs.gcc ];
+            configurePhase = ''
+              runHook preConfigure
+              export HOME=$TMPDIR
+              export npm_config_nodedir=${pkgs.electron_41.headers}
+              mkdir -p node_modules/node-addon-api
+              tar xzf $nodeAddonApi -C node_modules/node-addon-api --strip-components=1
+              node-gyp configure --nodedir=${pkgs.electron_41.headers} --arch=x64
+              runHook postConfigure
+            '';
+            buildPhase = ''
+              runHook preBuild
+              node-gyp build --nodedir=${pkgs.electron_41.headers} --arch=x64
+              runHook postBuild
+            '';
+            installPhase = ''
+              runHook preInstall
+              mkdir -p $out
+              cp build/Release/pty.node $out/pty.node
+              runHook postInstall
+            '';
+          };
 
           # Extract app.asar from DMG and apply patches
           claudeApp = pkgs.stdenv.mkDerivation {
@@ -158,23 +198,33 @@
               cat ${./scripts/cowork-init.js} >> "$INDEX"
               echo "[patch:01] Done"
 
-              # --- Patch 02: Platform flag (regex) ---
-              # Makes the Windows platform flag also true on Linux, routing through TS VM path
-              echo "[patch:02] Patching platform flag..."
-              perl -i -pe 's{(\w+=process\.platform==="darwin",)(\w+)(=process\.platform==="win32")}{$1$2$3||process.platform==="linux"}g' "$INDEX"
-              grep -qP '\w+=process\.platform==="win32"\|\|process\.platform==="linux"' "$INDEX" \
-                || { echo "ERROR: patch 02 (platform flag) failed to apply"; exit 1; }
-              echo "[patch:02] Done"
+              # --- Patch 02: RETIRED in v1.13576.4 ---
+              # Old role: flip the inlined `_o=process.platform==="win32"` boolean
+              # true on Linux to (a) mark the platform supported and (b) select the
+              # TS vmClient path. v1.13576.4 removed that boolean pair entirely:
+              #   - VM-implementation selection is gone (always loads @ant/claude-swift;
+              #     patches 06a/06b substitute the Linux VM via the qo()/f_t() getters).
+              #   - Cowork availability moved into one unified function (codename
+              #     "yukonSilver"), now handled by patch 03.
+              # No single flag remains to flip, so this patch is a no-op.
+              echo "[patch:02] Skipped (obsolete in v1.13576.4 — role absorbed by patches 03 + 06)"
 
-              # --- Patch 03: Availability check (regex) ---
-              # Prepends Linux "supported" return before the platform check.
-              # Function name may contain `$` in minified code (e.g. v1.2278.0's
-              # `J$n`), so match with [\w\$]+ rather than \w+.
-              # Local variable name varies across versions (t, e, ...) — use \w+.
-              echo "[patch:03] Patching availability check..."
-              perl -i -pe 's{(function )([\w\$]+)(\(\)\{)(const \w+=process\.platform;if\(\w+!=="darwin"&&\w+!=="win32"\)return\{status:"unsupported")}{$1$2$3if(process.platform==="linux"\&\&global.__linuxCowork)return\{status:"supported"\};$4}g' "$INDEX"
+              # --- Patch 03: Cowork availability (regex) ---
+              # v1.13576.4 unified Cowork availability into a single function
+              # (codename "yukonSilver", minified e.g. `Hce`) shaped as:
+              #   function X(){const a=S8i();if(a)return a;if(b)return b;
+              #                const c=w8i();if(c.status!=="supported")return ...}
+              # The old `const t=process.platform;if(t!=="darwin"&&t!=="win32")
+              # return{status:"unsupported"}` shape is gone. Inject a Linux
+              # "supported" early-return at the top of that function. This also
+              # subsumes old patch 02's availability role (the darwin/win32 boolean
+              # pair that fed availability was inlined away in this refactor).
+              # Anchor on the structural prefix (unique); function name may contain
+              # `$`, so match with [\w\$]+. Local names vary — use \w+.
+              echo "[patch:03] Patching Cowork availability..."
+              perl -i -pe 's{(function )([\w\$]+)(\(\)\{)(const \w+=\w+\(\);if\(\w+\)return \w+;if\(\w+\)return \w+;const \w+=\w+\(\);if\(\w+\.status!=="supported")}{$1$2$3if(process.platform==="linux"\&\&global.__linuxCowork)return\{status:"supported"\};$4}g' "$INDEX"
               grep -qP 'if\(process\.platform==="linux"&&global\.__linuxCowork\)return\{status:"supported"\}' "$INDEX" \
-                || { echo "ERROR: patch 03 (availability check) failed to apply"; exit 1; }
+                || { echo "ERROR: patch 03 (Cowork availability) failed to apply"; exit 1; }
               echo "[patch:03] Done"
 
               # --- Patch 04: Skip download (regex) ---
@@ -222,10 +272,18 @@
               echo "[patch:08a] Done"
 
               # --- Patch 08b: Tray icon filename (regex) ---
-              # Linux uses theme-aware PNGs instead of Windows ICOs
+              # v1.13576.4 replaced the old platform ternary with a switch on a
+              # build-time icon-type const (`OJr="template-image"`):
+              #   switch(t){case"ico":...Tray-Win32...;
+              #             case"template-image":e="TrayIconTemplate.png";break;
+              #             case"png":e=dark?"TrayIconTemplate-Dark.png":"...";break}
+              # On Linux the "template-image" case yields a non-theme-aware PNG and
+              # COSMIC's SNI can't do macOS-style template inversion, so make that
+              # case pick the dark variant when the system theme is dark. The
+              # electron namespace var (e.g. cA) is captured from the "ico" case.
               echo "[patch:08b] Patching tray icon filename selection..."
-              perl -i -pe 's{(\w+)\?(\w+)=(\w+)\.nativeTheme\.shouldUseDarkColors\?"Tray-Win32-Dark\.ico":"Tray-Win32\.ico":(\w+)="TrayIconTemplate\.png"}{process.platform==="linux"?($2=$3.nativeTheme.shouldUseDarkColors?"TrayIconTemplate-Dark.png":"TrayIconTemplate.png"):$1?$2=$3.nativeTheme.shouldUseDarkColors?"Tray-Win32-Dark.ico":"Tray-Win32.ico":$4="TrayIconTemplate.png"}g' "$INDEX"
-              grep -qP 'process\.platform==="linux"\?\(' "$INDEX" \
+              perl -i -pe 's{(case"ico":e=(\w+)\.nativeTheme\.shouldUseDarkColors\?"Tray-Win32-Dark\.ico":"Tray-Win32\.ico";break;case"template-image":e=)"TrayIconTemplate\.png"(;break)}{$1process.platform==="linux"\&\&$2.nativeTheme.shouldUseDarkColors?"TrayIconTemplate-Dark.png":"TrayIconTemplate.png"$3}g' "$INDEX"
+              grep -qP 'case"template-image":e=process\.platform==="linux"&&\w+\.nativeTheme\.shouldUseDarkColors\?"TrayIconTemplate-Dark\.png":"TrayIconTemplate\.png"' "$INDEX" \
                 || { echo "ERROR: patch 08b (tray icon filename) failed to apply"; exit 1; }
               echo "[patch:08b] Done"
 
@@ -246,37 +304,39 @@
                 || { echo "ERROR: patch 11 (shellPathWorker base) failed to apply"; exit 1; }
               echo "[patch:11] Done"
 
-              # --- Patch 12: Neutralize [1m] model-suffix feature flag (regex) ---
-              # Anthropic appends "[1m]" to selected model ids. In older builds
-              # this was gated by GrowthBook flag 3885610113; in v1.9255.x it is
-              # based on the discovered inference model list. Either way, the
-              # suffixed model config request 404s and disables Code/LOCAL sends.
-              # Replace the suffix function body with a pass-through.
-              # Names vary across versions and may contain `$`.
-              echo "[patch:12] Neutralizing [1m] model-suffix feature flag..."
+              # --- Patch 12: Neutralize [1m] model-suffix functions (regex) ---
+              # Anthropic appends "[1m]" to selected model ids; the suffixed
+              # model_configs request 404s and disables Code/LOCAL sends. v1.13576.4
+              # applies the suffix via TWO chained functions in the send path:
+              #   WcA(A){return/\[1m\]/i.test(A)||!k().some(...)?A:`''${A}[1m]`}  (old style)
+              #   czA(A,e){return!e||R.test(A)?A:`''${A}[1m]`}                     (NEW)
+              # called as reconcileModel=czA(WcA(...)) and {model:czA(A,!0)}. Since
+              # czA(A,!0) force-appends the suffix, BOTH must be neutralized to a
+              # pass-through. The model catalog list (…map(s=>`''${s}[1m]`)) is left
+              # intact, matching prior behaviour. Names vary and may contain `$`.
+              echo "[patch:12] Neutralizing [1m] model-suffix functions..."
               grep -qP 'function [\w\$]+\([\w\$]+\)\{return/\\\[1m\\\]/i\.test' "$INDEX" \
-                || { echo "ERROR: patch 12 target function not found (pre-check)"; exit 1; }
+                || { echo "ERROR: patch 12 target function (WcA-style) not found (pre-check)"; exit 1; }
+              # 12a: WcA-style single-arg suffixer -> pass-through
               perl -i -pe 's{function ([\w\$]+)\(([\w\$]+)\)\{return/\\\[1m\\\]/i\.test\(\2\)\|\|.+?\?\2:`\$\{\2\}\[1m\]`\}}{function $1($2){return $2}}g' "$INDEX"
-              if grep -qP 'function [\w\$]+\([\w\$]+\)\{return/\\\[1m\\\]/i\.test' "$INDEX"; then
-                echo "ERROR: patch 12 ([1m] suffix) did not neutralize target"
+              # 12b: czA-style two-arg suffixer (return!e||R.test(A)?A:`''${A}[1m]`) -> pass-through
+              perl -i -pe 's{function ([\w\$]+)\(([\w\$]+),([\w\$]+)\)\{return!\3\|\|[\w\$]+\.test\(\2\)\?\2:`\$\{\2\}\[1m\]`\}}{function $1($2,$3){return $2}}g' "$INDEX"
+              if grep -qP 'function [\w\$]+\([\w\$,]+\)\{return[^}]{0,90}:`\$\{[\w\$]+\}\[1m\]`\}' "$INDEX"; then
+                echo "ERROR: patch 12 ([1m] suffix) — a suffix function still remains"
                 exit 1
               fi
               echo "[patch:12] Done"
 
-              # --- Patch 13: getHostPlatform Linux return (regex) ---
-              # v1.6608.2 added new send-pipeline call sites that await Ta.prepare()
-              # and Ta.getBinaryPathIfReady(). Both fall through to getHostPlatform(),
-              # which throws `Unsupported platform: linux-x64` and surfaces in the chat
-              # UI as "Something went wrong" — including in Cowork. Inject a Linux
-              # return clause so getHostTarget() resolves to a valid (downloadless)
-              # platform; CCD then returns {ready:!1} cleanly instead of throwing.
-              # Local variable name is captured and back-referenced (\2) to keep the
-              # regex anchored on the original three-branch shape.
-              echo "[patch:13] Patching getHostPlatform Linux return..."
-              perl -i -pe 's{(getHostPlatform\(\)\{const (\w+)=process\.arch;if\(process\.platform==="darwin"\)return \2==="arm64"\?"darwin-arm64":"darwin-x64";if\(process\.platform==="win32"\)return \2==="arm64"\?"win32-arm64":"win32-x64";)(throw new Error\(`Unsupported platform:)}{$1if(process.platform==="linux")return $2==="arm64"?"linux-arm64":"linux-x64";$3}g' "$INDEX"
-              grep -qP 'if\(process\.platform==="linux"\)return \w+==="arm64"\?"linux-arm64":"linux-x64";throw new Error\(`Unsupported platform:' "$INDEX" \
-                || { echo "ERROR: patch 13 (getHostPlatform Linux return) failed to apply"; exit 1; }
-              echo "[patch:13] Done"
+              # --- Patch 13: RETIRED in v1.13576.4 ---
+              # getHostPlatform() now ships a native Linux branch upstream:
+              #   if(process.platform==="linux")return a==="arm64"?"linux-arm64":"linux-x64";
+              # so it no longer throws `Unsupported platform: linux-x64`. Rather than
+              # inject the branch, assert it is present — if a future version drops it,
+              # this verification fails loudly so the injection can be restored.
+              echo "[patch:13] Verifying native getHostPlatform Linux branch..."
+              grep -qP 'getHostPlatform\(\)\{const \w+=process\.arch;.{0,160}if\(process\.platform==="linux"\)return \w+==="arm64"\?"linux-arm64":"linux-x64"' "$INDEX" \
+                || { echo "ERROR: patch 13 — native getHostPlatform Linux branch missing; re-derive injection needed"; exit 1; }
+              echo "[patch:13] Done (native upstream branch, no patch needed)"
 
               # --- Patch 14: CLAUDE_CODE_LOCAL_BINARY constructor wiring (regex) ---
               # v1.6608.2 minified the env-var bridge into a dead expression
@@ -291,17 +351,61 @@
                 || { echo "ERROR: patch 14 (CLAUDE_CODE_LOCAL_BINARY wiring) failed to apply"; exit 1; }
               echo "[patch:14] Done"
 
-              # --- Patch 15: VM bundle file lookup Linux fallback (regex) ---
-              # v1.9255.x's ClaudeVM.getDownloadStatus calls a helper that reads
-              # `Qo.files[process.platform][arch]`. The VM bundle manifest has no
-              # Linux key, so the handler throws `Cannot read properties of
-              # undefined (reading 'x64')` on startup. Return [] when the platform
-              # entry is absent; Linux already skips VM downloads via patch 04.
-              echo "[patch:15] Patching VM bundle file lookup fallback..."
-              perl -i -pe 's{function ([\w\$]+)\(\)\{const (\w+)=process\.platform,(\w+)=([\w\$]+)\(\);return ([\w\$]+)\.files\[\2\]\[\3\]\?\?\[\]\}}{function $1(){const $2=process.platform,$3=$4();return ($5.files[$2]\&\&$5.files[$2][$3])??[]}}g' "$INDEX"
-              grep -qP 'return \([\w\$]+\.files\[\w+\]&&[\w\$]+\.files\[\w+\]\[\w+\]\)\?\?\[\]' "$INDEX" \
-                || { echo "ERROR: patch 15 (VM bundle file lookup fallback) failed to apply"; exit 1; }
-              echo "[patch:15] Done"
+              # --- Patch 15: RETIRED in v1.13576.4 ---
+              # v1.9255.x's bundle-file helper read `Qo.files[process.platform][arch]`,
+              # which threw `Cannot read properties of undefined (reading 'x64')` on
+              # Linux because the manifest has no "linux" key. v1.13576.4 hardcodes the
+              # platform key to "darwin" (`fo.files["darwin"][arch]??[]`), so the
+              # undefined-index crash can no longer occur on Linux. Assert the lookup
+              # is no longer indexed by process.platform — if a dynamic-platform form
+              # returns, re-derive the guard.
+              echo "[patch:15] Verifying VM bundle lookup is no longer platform-dynamic..."
+              grep -qP '[\w\$]+\.files\["darwin"\]\[\w+\(\)\]\?\?\[\]' "$INDEX" \
+                || { echo "ERROR: patch 15 — expected darwin-keyed bundle lookup not found; re-derive guard"; exit 1; }
+              if grep -qP '\.files\[\w+\]\[\w+\]\?\?\[\]' "$INDEX"; then
+                echo "ERROR: patch 15 — dynamic .files[platform][arch] lookup present; re-derive guard"; exit 1
+              fi
+              echo "[patch:15] Done (native darwin-keyed lookup, no patch needed)"
+
+              # --- Patch 16: Guard macOS-fork-only Electron startup APIs (regex) ---
+              # Anthropic's macOS build runs a custom Electron fork with extra native
+              # `app`/`systemPreferences` methods. nixpkgs' stock electron_41 lacks
+              # them, so v1.13576.4's top-level app-init calls throw at module load
+              # (before any window opens). Guard each so the init sequence proceeds:
+              #   16a `systemPreferences.setUserDefault("NSAutoFillHeuristicsEnabled",
+              #        "boolean",!1)` — macOS NSUserDefaults write. Darwin-guard it;
+              #        `&&` binds tighter than the trailing comma so bCo() still runs.
+              #   16b `app.configureWebAuthn({touchID:{keychainAccessGroup:…}})` (in
+              #        bCo) — macOS TouchID WebAuthn config. Existence-guard it (it is
+              #        an API-presence issue, not purely platform) so it no-ops on
+              #        stock Electron and self-enables if a build ever ships the API.
+              echo "[patch:16] Guarding macOS-fork-only Electron startup APIs..."
+              perl -i -pe 's{((\w+)\.systemPreferences\.setUserDefault\("NSAutoFillHeuristicsEnabled","boolean",!1\))}{process.platform==="darwin"\&\&$1}g' "$INDEX"
+              grep -qP 'process\.platform==="darwin"&&\w+\.systemPreferences\.setUserDefault\("NSAutoFillHeuristicsEnabled"' "$INDEX" \
+                || { echo "ERROR: patch 16a (setUserDefault guard) failed to apply"; exit 1; }
+              perl -i -pe 's{(\w+)\.app\.configureWebAuthn\(}{$1.app.configureWebAuthn\&\&$1.app.configureWebAuthn(}g' "$INDEX"
+              grep -qP '\w+\.app\.configureWebAuthn&&\w+\.app\.configureWebAuthn\(' "$INDEX" \
+                || { echo "ERROR: patch 16b (configureWebAuthn guard) failed to apply"; exit 1; }
+              echo "[patch:16] Done"
+
+              # --- Patch 17: Guard macOS-only BrowserWindow chrome APIs (regex) ---
+              # macOS-only window-chrome methods that stock electron_41 lacks. Unlike
+              # patch 16's calls these fire during window setup (async), so they don't
+              # block launch — they surface as unhandled promise rejections and spam
+              # Sentry. Existence-guard them:
+              #   17a `win.setWindowButtonPosition({x,y})` — positions the mac traffic
+              #        lights; called from a zoom-factor handler that runs on Linux.
+              #   17b `win.setHiddenInMissionControl(!0)` — one call site is not behind
+              #        a darwin check (always-on-top pop-up path). Blanket-guarding all
+              #        sites is safe; darwin-gated ones just gain a harmless inner check.
+              echo "[patch:17] Guarding macOS-only BrowserWindow chrome APIs..."
+              perl -i -pe 's{(\w+)\.setWindowButtonPosition\(}{$1.setWindowButtonPosition\&\&$1.setWindowButtonPosition(}g' "$INDEX"
+              grep -qP '\w+\.setWindowButtonPosition&&\w+\.setWindowButtonPosition\(' "$INDEX" \
+                || { echo "ERROR: patch 17a (setWindowButtonPosition guard) failed to apply"; exit 1; }
+              perl -i -pe 's{(\w+)\.setHiddenInMissionControl\(}{$1.setHiddenInMissionControl\&\&$1.setHiddenInMissionControl(}g' "$INDEX"
+              grep -qP '\w+\.setHiddenInMissionControl&&\w+\.setHiddenInMissionControl\(' "$INDEX" \
+                || { echo "ERROR: patch 17b (setHiddenInMissionControl guard) failed to apply"; exit 1; }
+              echo "[patch:17] Done"
 
               # Repack ASAR
               echo "[5/6] Repacking ASAR..."
@@ -322,6 +426,19 @@
               if [ -d "$(dirname $(find dmg-contents -name 'app.asar' -path '*/Contents/Resources/*' | head -1))/app.asar.unpacked" ]; then
                 cp -r "$(dirname $(find dmg-contents -name 'app.asar' -path '*/Contents/Resources/*' | head -1))/app.asar.unpacked" \
                   $out/lib/claude-desktop/app.asar.unpacked
+                chmod -R u+w $out/lib/claude-desktop/app.asar.unpacked
+              fi
+
+              # --- Patch 18: Linux-native node-pty pty.node ---
+              # The DMG's app.asar.unpacked ships a macOS Mach-O pty.node, so node-pty
+              # fails to load on Linux and the in-app terminal/shell PTY is dead. Overlay
+              # the electron-41-built Linux binary (spawn-helper is macOS-only, left as-is).
+              PTY_DIR="$out/lib/claude-desktop/app.asar.unpacked/node_modules/node-pty/build/Release"
+              if [ -d "$PTY_DIR" ]; then
+                cp ${nodePtyElectron}/pty.node "$PTY_DIR/pty.node"
+                echo "[patch:18] Overlaid Linux-native node-pty pty.node"
+              else
+                echo "ERROR: patch 18 — node-pty unpacked dir not found at $PTY_DIR"; exit 1
               fi
 
               # Copy tray icons and app icon to real filesystem (alongside ASAR)
