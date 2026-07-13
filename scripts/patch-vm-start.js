@@ -12,7 +12,16 @@ const fs = require('fs');
 const path = require('path');
 
 const EXTRACTED_DIR = process.argv[2] || '/tmp/app-extracted';
-const INDEX_JS_PATH = path.join(EXTRACTED_DIR, '.vite/build/index.js');
+
+// The main process is code-split as of v1.20186.1: index.js is a stub that requires
+// index.chunk-<hash>.js, where the app code (and this patch's target) now lives. The
+// caller passes the resolved file; standalone runs re-derive it from index.js.
+const INDEX_JS_PATH = process.argv[3] || (() => {
+  const buildDir = path.join(EXTRACTED_DIR, '.vite/build');
+  const entry = path.join(buildDir, 'index.js');
+  const chunk = /require\("\.\/(index\.chunk-[\w-]+\.js)"\)/.exec(fs.readFileSync(entry, 'utf8'));
+  return chunk ? path.join(buildDir, chunk[1]) : entry;
+})();
 
 console.log('=== Dynamic Patch: VM Start Intercept ===\n');
 

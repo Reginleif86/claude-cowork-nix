@@ -2,6 +2,60 @@
 // Key difference from existing solutions: Uses Electron APIs instead of no-ops
 const { BrowserWindow, Notification, app, nativeImage } = require('electron');
 const os = require('os');
+const fs = require('fs');
+const fsp = require('fs/promises');
+const path = require('path');
+
+// --- Safe-fs containment helpers (see openRootDir & friends below) ---
+
+function fsError(code, message) {
+  const err = new Error(message);
+  err.code = code;
+  return err;
+}
+
+// Reject anything that could walk out of the root before touching the filesystem.
+function checkSegments(segments) {
+  if (!Array.isArray(segments) || segments.length === 0) {
+    throw fsError('EINVAL', 'safe-fs: expected a non-empty array of path segments');
+  }
+  for (const seg of segments) {
+    if (typeof seg !== 'string' || seg === '' || seg === '.' || seg === '..' ||
+        seg.includes('/') || seg.includes('\\') || seg.includes('\0')) {
+      throw fsError('EINVAL', `safe-fs: unsafe path segment ${JSON.stringify(seg)}`);
+    }
+  }
+}
+
+// The native module resolves these with openat2(RESOLVE_BENEATH), which JS cannot
+// reach. Emulate its guarantee: realpath the deepest existing ancestor and require
+// it to stay under the root, so a symlink aimed outside fails with ELOOP — the code
+// the callers already treat as an unsafe path.
+async function resolveBeneath(root, segments) {
+  const base = root && root.path;
+  if (typeof base !== 'string') throw fsError('EINVAL', 'safe-fs: invalid root handle');
+  checkSegments(segments);
+
+  const full = path.join(base, ...segments);
+  let probe = full;
+  for (;;) {
+    let real;
+    try {
+      real = await fsp.realpath(probe);
+    } catch (err) {
+      // Not created yet — the containment check applies to its nearest existing parent.
+      if (err.code === 'ENOENT' && path.dirname(probe) !== probe) {
+        probe = path.dirname(probe);
+        continue;
+      }
+      throw err;
+    }
+    if (real !== base && !real.startsWith(base + path.sep)) {
+      throw fsError('ELOOP', `safe-fs: ${full} escapes root ${base}`);
+    }
+    return full;
+  }
+}
 
 // Set Claude icon on every BrowserWindow so the dock shows the correct icon
 if (process.platform === 'linux') {
@@ -234,8 +288,48 @@ class ClaudeNativeLinux {
     return true;
   }
 
-  // File system operations - delegate to Node.js fs module
-  // (if the app uses these, they should work fine with standard fs)
+  // Safe-fs containment API (required as of v1.20186.1)
+  // The app routes contained file access — document baselines, scratch roots — through
+  // these, and explicitly refuses to fall back to a path-based open when the native
+  // module lacks them ("@ant/claude-native is required for safe-fs containment", CC-2885).
+  // Without them the app throws UnsafeRootError at startup, so these must exist.
+  // Roots are opaque to the caller and are never closed, so hold a path rather than an fd.
+  async openRootDir(rootPath) {
+    if (typeof rootPath !== 'string' || rootPath === '') {
+      throw fsError('EINVAL', 'safe-fs: root path must be a non-empty string');
+    }
+    const real = await fsp.realpath(rootPath);
+    if (!(await fsp.stat(real)).isDirectory()) {
+      throw fsError('ENOTDIR', `safe-fs: ${rootPath} is not a directory`);
+    }
+    return { __safeFsRoot: true, path: real };
+  }
+
+  async openBeneath(root, segments, flags, mode) {
+    const full = await resolveBeneath(root, segments);
+    // fsPromises.open() hands back a FileHandle that closes its fd on GC; callers want
+    // a raw descriptor they close themselves via fs.close(), so use the callback form.
+    return await new Promise((resolve, reject) => {
+      fs.open(full, flags, mode ?? 0o600, (err, fd) => (err ? reject(err) : resolve(fd)));
+    });
+  }
+
+  async mkdirBeneath(root, segments, mode) {
+    const full = await resolveBeneath(root, segments);
+    // Non-recursive on purpose: the caller emulates recursion by walking each path
+    // prefix in turn and relying on EEXIST for the levels that already exist.
+    await fsp.mkdir(full, { mode: mode ?? 0o700 });
+  }
+
+  async renameBeneath(root, fromSegments, toSegments) {
+    const from = await resolveBeneath(root, fromSegments);
+    const to = await resolveBeneath(root, toSegments);
+    await fsp.rename(from, to);
+  }
+
+  async unlinkBeneath(root, segments) {
+    await fsp.unlink(await resolveBeneath(root, segments));
+  }
 
   getAppInfoForFile(filePath) {
     // Linux has no direct equivalent to the native macOS/Windows file-owner lookup.

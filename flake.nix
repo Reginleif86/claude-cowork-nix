@@ -9,9 +9,9 @@
   outputs = { self, nixpkgs, flake-utils }:
     let
       # Claude Desktop version and source
-      claudeVersion = "1.13576.4";
-      claudeDmgHash = "sha256-GNWWWGHJPrpv0NhzUdAFh7eeXSgyrv+ynQuRemHiJ0Q=";
-      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/1.13576.4/Claude-414f858c8545ff8af38af267a1da714429ee98f9.dmg";
+      claudeVersion = "1.20186.1";
+      claudeDmgHash = "sha256-D4HdtSNgwOmlWDxFzJt/F0OK6A3bJgJimbuMvBTPAyQ=";
+      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/1.20186.1/Claude-df1d8a339dfabcf359af7144fe142b59ff7d9a0f.dmg";
 
       supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
 
@@ -48,10 +48,14 @@
           # only (gyp OS=="mac"; pty.cc execs it under __APPLE__) — Linux forks directly.
           nodePtyElectron = pkgs.stdenv.mkDerivation {
             pname = "node-pty-electron";
-            version = "1.1.0-beta34";
+            # Must track the node-pty version whose JS the DMG bundles (see
+            # node_modules/node-pty/package.json). N-API keeps the *ABI* stable across
+            # Electron versions, but not node-pty's own JS<->native API: a mismatched
+            # pty.node loads fine and then throws on a method the JS expects.
+            version = "1.2.0-beta.13";
             src = pkgs.fetchurl {
-              url = "https://registry.npmjs.org/node-pty/-/node-pty-1.1.0-beta34.tgz";
-              hash = "sha256-LxvUoachiyWC2M3hxxTDZ6InsdLuKwjLrJ+gM4GdWeQ=";
+              url = "https://registry.npmjs.org/node-pty/-/node-pty-1.2.0-beta.13.tgz";
+              hash = "sha256-gnqPjagQK3EiGITsbgu2FwjvkaEx6XC2lzvkSu2Yq0U=";
             };
             nodeAddonApi = pkgs.fetchurl {
               url = "https://registry.npmjs.org/node-addon-api/-/node-addon-api-7.1.1.tgz";
@@ -176,8 +180,26 @@
               # Apply patches (version-resilient regex + dynamic discovery)
               echo "[4/6] Applying patches..."
 
-              INDEX="extracted/.vite/build/index.js"
-              MAINVIEW="extracted/.vite/build/mainView.js"
+              # v1.20186.1 code-split the Electron main process. The load chain is:
+              #   package.json main -> .vite/build/index.pre.js  (Sentry bootstrap +
+              #                                                    launch-failure dialog)
+              #     -> require("./index.js")                     (~800-byte stub)
+              #       -> require("./index.chunk-<hash>.js")      (4.4 MB — the app code
+              #                                                    formerly in index.js)
+              # Every patch target below lives in that chunk. Its hash is content-derived
+              # and changes on each release, so resolve it from index.js's require()
+              # rather than hardcoding. Older monolithic builds have no such require and
+              # fall back to index.js itself.
+              BUILD_DIR="extracted/.vite/build"
+              CHUNK=$(perl -ne 'print "$1\n" if m{require\("\./(index\.chunk-[\w-]+\.js)"\)}' "$BUILD_DIR/index.js" | head -1)
+              if [ -n "$CHUNK" ] && [ -f "$BUILD_DIR/$CHUNK" ]; then
+                INDEX="$BUILD_DIR/$CHUNK"
+                echo "  Main process is code-split; patching $CHUNK"
+              else
+                INDEX="$BUILD_DIR/index.js"
+                echo "  Main process is monolithic; patching index.js"
+              fi
+              MAINVIEW="$BUILD_DIR/mainView.js"
 
               # --- Patch 00: Native module stub ---
               echo "[patch:00] Installing native module stub..."
@@ -239,7 +261,7 @@
               # --- Patch 05: VM start intercept (dynamic Node.js) ---
               # Discovers function name via [VM:start] log string, injects bubblewrap session
               echo "[patch:05] Patching VM start intercept..."
-              ${pkgs.nodejs}/bin/node ${./scripts/patch-vm-start.js} extracted
+              ${pkgs.nodejs}/bin/node ${./scripts/patch-vm-start.js} extracted "$INDEX"
               echo "[patch:05] Done"
 
               # --- Patch 06a: VM getter (regex) ---
@@ -272,18 +294,23 @@
               echo "[patch:08a] Done"
 
               # --- Patch 08b: Tray icon filename (regex) ---
-              # v1.13576.4 replaced the old platform ternary with a switch on a
-              # build-time icon-type const (`OJr="template-image"`):
-              #   switch(t){case"ico":...Tray-Win32...;
-              #             case"template-image":e="TrayIconTemplate.png";break;
-              #             case"png":e=dark?"TrayIconTemplate-Dark.png":"...";break}
-              # On Linux the "template-image" case yields a non-theme-aware PNG and
-              # COSMIC's SNI can't do macOS-style template inversion, so make that
-              # case pick the dark variant when the system theme is dark. The
-              # electron namespace var (e.g. cA) is captured from the "ico" case.
+              # The tray icon is chosen by a switch on a build-time icon-type const
+              # (`Ymt="template-image"` in the macOS build we repackage):
+              #   switch(Ymt){case"ico":  t=dark?"Tray-Win32-Dark.ico":"Tray-Win32.ico";break;
+              #               case"template-image": t="TrayIconTemplate.png";break;
+              #               case"png": t=de()==="gnome"||dark?"TrayIconLinux-Dark.png"
+              #                                                :"TrayIconLinux.png";break}
+              # v1.20186.1 added that "png" case with real Linux tray assets (shipped in
+              # the DMG) and a GNOME check — GNOME's top bar is dark, so it forces the
+              # dark icon regardless of theme. But the const is baked to "template-image",
+              # so on Linux we always land on the macOS template: a non-theme-aware PNG
+              # that COSMIC's SNI cannot invert the way macOS does.
+              # Route the template case to upstream's own Linux expression on Linux,
+              # capturing the desktop-env fn and electron namespace from the "png" case
+              # so their minified names stay wildcards. Non-Linux behaviour is unchanged.
               echo "[patch:08b] Patching tray icon filename selection..."
-              perl -i -pe 's{(case"ico":e=(\w+)\.nativeTheme\.shouldUseDarkColors\?"Tray-Win32-Dark\.ico":"Tray-Win32\.ico";break;case"template-image":e=)"TrayIconTemplate\.png"(;break)}{$1process.platform==="linux"\&\&$2.nativeTheme.shouldUseDarkColors?"TrayIconTemplate-Dark.png":"TrayIconTemplate.png"$3}g' "$INDEX"
-              grep -qP 'case"template-image":e=process\.platform==="linux"&&\w+\.nativeTheme\.shouldUseDarkColors\?"TrayIconTemplate-Dark\.png":"TrayIconTemplate\.png"' "$INDEX" \
+              perl -i -pe 's{case"template-image":([\w\$]+)="TrayIconTemplate\.png";break;(case"png":\1=([\w\$]+)\(\)==="gnome"\|\|([\w\$]+)\.nativeTheme\.shouldUseDarkColors\?"TrayIconLinux-Dark\.png":"TrayIconLinux\.png";break)}{case"template-image":$1=process.platform==="linux"?($3()==="gnome"||$4.nativeTheme.shouldUseDarkColors?"TrayIconLinux-Dark.png":"TrayIconLinux.png"):"TrayIconTemplate.png";break;$2}g' "$INDEX"
+              grep -qP 'case"template-image":[\w\$]+=process\.platform==="linux"\?\([\w\$]+\(\)==="gnome"\|\|[\w\$]+\.nativeTheme\.shouldUseDarkColors\?"TrayIconLinux-Dark\.png":"TrayIconLinux\.png"\):"TrayIconTemplate\.png"' "$INDEX" \
                 || { echo "ERROR: patch 08b (tray icon filename) failed to apply"; exit 1; }
               echo "[patch:08b] Done"
 
@@ -304,28 +331,25 @@
                 || { echo "ERROR: patch 11 (shellPathWorker base) failed to apply"; exit 1; }
               echo "[patch:11] Done"
 
-              # --- Patch 12: Neutralize [1m] model-suffix functions (regex) ---
-              # Anthropic appends "[1m]" to selected model ids; the suffixed
-              # model_configs request 404s and disables Code/LOCAL sends. v1.13576.4
-              # applies the suffix via TWO chained functions in the send path:
-              #   WcA(A){return/\[1m\]/i.test(A)||!k().some(...)?A:`''${A}[1m]`}  (old style)
-              #   czA(A,e){return!e||R.test(A)?A:`''${A}[1m]`}                     (NEW)
-              # called as reconcileModel=czA(WcA(...)) and {model:czA(A,!0)}. Since
-              # czA(A,!0) force-appends the suffix, BOTH must be neutralized to a
-              # pass-through. The model catalog list (…map(s=>`''${s}[1m]`)) is left
-              # intact, matching prior behaviour. Names vary and may contain `$`.
-              echo "[patch:12] Neutralizing [1m] model-suffix functions..."
-              grep -qP 'function [\w\$]+\([\w\$]+\)\{return/\\\[1m\\\]/i\.test' "$INDEX" \
-                || { echo "ERROR: patch 12 target function (WcA-style) not found (pre-check)"; exit 1; }
-              # 12a: WcA-style single-arg suffixer -> pass-through
-              perl -i -pe 's{function ([\w\$]+)\(([\w\$]+)\)\{return/\\\[1m\\\]/i\.test\(\2\)\|\|.+?\?\2:`\$\{\2\}\[1m\]`\}}{function $1($2){return $2}}g' "$INDEX"
-              # 12b: czA-style two-arg suffixer (return!e||R.test(A)?A:`''${A}[1m]`) -> pass-through
-              perl -i -pe 's{function ([\w\$]+)\(([\w\$]+),([\w\$]+)\)\{return!\3\|\|[\w\$]+\.test\(\2\)\?\2:`\$\{\2\}\[1m\]`\}}{function $1($2,$3){return $2}}g' "$INDEX"
-              if grep -qP 'function [\w\$]+\([\w\$,]+\)\{return[^}]{0,90}:`\$\{[\w\$]+\}\[1m\]`\}' "$INDEX"; then
-                echo "ERROR: patch 12 ([1m] suffix) — a suffix function still remains"
+              # --- Patch 12: RETIRED in v1.20186.1 ---
+              # Up to v1.13576.4 the send path force-appended "[1m]" to the selected
+              # model id via two chained suffixer functions:
+              #   WcA(A){return/\[1m\]/i.test(A)||!k().some(...)?A:`''${A}[1m]`}
+              #   czA(A,e){return!e||R.test(A)?A:`''${A}[1m]`}
+              # The suffixed id 404s against model_configs, which disabled the Code/LOCAL
+              # send button — so both were neutralized to pass-throughs.
+              # v1.20186.1 removes the forced suffixing entirely. "[1m]" now survives only
+              # in the model *catalog* builders, which expand a 1M-capable model into two
+              # selectable entries ([id, id[1m]] with supports_1m_context:!0) — opt-in, and
+              # exactly what this patch always left intact. Nothing to neutralize.
+              # Assert no forced suffixer returns; if one does, the send button silently
+              # breaks again, so fail loudly and restore the pass-through rewrite.
+              echo "[patch:12] Verifying no forced [1m] model-suffix function remains..."
+              if grep -qP '\?[\w\$]+:`\$\{[\w\$]+\}\[1m\]`' "$INDEX"; then
+                echo "ERROR: patch 12 — a forced [1m] suffix function is back; restore the neutralizing rewrite"
                 exit 1
               fi
-              echo "[patch:12] Done"
+              echo "[patch:12] Done (upstream no longer force-appends [1m], no patch needed)"
 
               # --- Patch 13: RETIRED in v1.13576.4 ---
               # getHostPlatform() now ships a native Linux branch upstream:
@@ -351,21 +375,29 @@
                 || { echo "ERROR: patch 14 (CLAUDE_CODE_LOCAL_BINARY wiring) failed to apply"; exit 1; }
               echo "[patch:14] Done"
 
-              # --- Patch 15: RETIRED in v1.13576.4 ---
+              # --- Patch 15: RETIRED (v1.13576.4), re-verified for v1.20186.1 ---
               # v1.9255.x's bundle-file helper read `Qo.files[process.platform][arch]`,
               # which threw `Cannot read properties of undefined (reading 'x64')` on
-              # Linux because the manifest has no "linux" key. v1.13576.4 hardcodes the
-              # platform key to "darwin" (`fo.files["darwin"][arch]??[]`), so the
-              # undefined-index crash can no longer occur on Linux. Assert the lookup
-              # is no longer indexed by process.platform — if a dynamic-platform form
-              # returns, re-derive the guard.
-              echo "[patch:15] Verifying VM bundle lookup is no longer platform-dynamic..."
-              grep -qP '[\w\$]+\.files\["darwin"\]\[\w+\(\)\]\?\?\[\]' "$INDEX" \
-                || { echo "ERROR: patch 15 — expected darwin-keyed bundle lookup not found; re-derive guard"; exit 1; }
-              if grep -qP '\.files\[\w+\]\[\w+\]\?\?\[\]' "$INDEX"; then
-                echo "ERROR: patch 15 — dynamic .files[platform][arch] lookup present; re-derive guard"; exit 1
-              fi
-              echo "[patch:15] Done (native darwin-keyed lookup, no patch needed)"
+              # Linux because the manifest had no "linux" key. v1.13576.4 dodged that by
+              # hardcoding the key to "darwin".
+              # v1.20186.1 goes further and makes Linux a real platform key: a mapper
+              # folds both desktop unices into one bucket
+              #   G4(p){switch(p){case"darwin":case"linux":return"unix";
+              #                   case"win32":return"win32";default:return null}}
+              # and the manifest ships `files.unix.{x64,arm64}` (a rootfs.img), so the
+              # lookup `ur.files[G4(process.platform)][arch]??[]` resolves on Linux and
+              # the undefined-index crash is structurally impossible. (Upstream also
+              # added a downloads.claude.ai/vms/linux/<arch>/<sha> URL builder — see
+              # COWORK_PROGRESS.md; we still skip the download via patch 04.)
+              # Losing the linux->unix mapping is what would resurrect the crash, so
+              # assert it, plus the null-guard that keeps an unknown platform from
+              # indexing undefined.
+              echo "[patch:15] Verifying VM bundle lookup maps Linux to a real key..."
+              grep -qP 'switch\([\w\$]+\)\{case"darwin":case"linux":return"unix";' "$INDEX" \
+                || { echo "ERROR: patch 15 — linux is no longer mapped to a bundle key; re-derive guard"; exit 1; }
+              grep -qP 'if\(![\w\$]+\)return\[\];const [\w\$]+=[\w\$]+\(\);return [\w\$]+\.files\[[\w\$]+\]\[[\w\$]+\]\?\?\[\]' "$INDEX" \
+                || { echo "ERROR: patch 15 — bundle lookup lost its null-platform guard; re-derive guard"; exit 1; }
+              echo "[patch:15] Done (linux maps to files.unix upstream, no patch needed)"
 
               # --- Patch 16: Guard macOS-fork-only Electron startup APIs (regex) ---
               # Anthropic's macOS build runs a custom Electron fork with extra native
@@ -407,6 +439,23 @@
                 || { echo "ERROR: patch 17b (setHiddenInMissionControl guard) failed to apply"; exit 1; }
               echo "[patch:17] Done"
 
+              # --- Patch 18a: reserve node-pty's build/Release in the ASAR header ---
+              # node-pty resolves its addon by trying, in order, build/Release,
+              # build/Debug, then prebuilds/<platform>-<arch> (lib/utils.js:loadNativeModule),
+              # relative to both the package root and lib/. The macOS DMG ships its addon
+              # under prebuilds/darwin-{x64,arm64}/ (node-pty switched to a prebuildify
+              # layout in 1.2.x), so there is no build/Release for us to overlay and no
+              # linux-* prebuild directory at all.
+              # asar_tool skips unpacked files on extract but keeps their directories, so
+              # the header records those dirs. Reserve build/Release the same way, then
+              # drop the Linux pty.node into the matching app.asar.unpacked path in
+              # installPhase (patch 18b). build/Release is first in the search order and
+              # is arch-agnostic, so it wins over the darwin prebuilds without needing a
+              # linux-x64/linux-arm64 split.
+              echo "[patch:18a] Reserving node-pty build/Release in ASAR header..."
+              mkdir -p extracted/node_modules/node-pty/build/Release
+              echo "[patch:18a] Done"
+
               # Repack ASAR
               echo "[5/6] Repacking ASAR..."
               ${asarTool}/bin/asar-tool pack extracted app.asar
@@ -429,25 +478,44 @@
                 chmod -R u+w $out/lib/claude-desktop/app.asar.unpacked
               fi
 
-              # --- Patch 18: Linux-native node-pty pty.node ---
-              # The DMG's app.asar.unpacked ships a macOS Mach-O pty.node, so node-pty
-              # fails to load on Linux and the in-app terminal/shell PTY is dead. Overlay
-              # the electron-41-built Linux binary (spawn-helper is macOS-only, left as-is).
-              PTY_DIR="$out/lib/claude-desktop/app.asar.unpacked/node_modules/node-pty/build/Release"
-              if [ -d "$PTY_DIR" ]; then
-                cp ${nodePtyElectron}/pty.node "$PTY_DIR/pty.node"
-                echo "[patch:18] Overlaid Linux-native node-pty pty.node"
-              else
-                echo "ERROR: patch 18 — node-pty unpacked dir not found at $PTY_DIR"; exit 1
+              # --- Patch 18b: Linux-native node-pty pty.node ---
+              # The DMG only ships macOS Mach-O addons (prebuilds/darwin-{x64,arm64}/
+              # pty.node), so node-pty finds nothing loadable on Linux and the in-app
+              # terminal/shell PTY is dead ("Cannot find module .../pty.node"). Install the
+              # electron-41-built Linux binary into build/Release, the first path node-pty
+              # searches; patch 18a reserved the matching dir in the ASAR header.
+              # The darwin prebuilds are left in place (inert on Linux), as is spawn-helper
+              # — pty.cc only execs it under __APPLE__; Linux forks directly.
+              PTY_UNPACKED="$out/lib/claude-desktop/app.asar.unpacked/node_modules/node-pty"
+              if [ ! -d "$PTY_UNPACKED" ]; then
+                echo "ERROR: patch 18b — node-pty unpacked dir not found at $PTY_UNPACKED"; exit 1
               fi
+              mkdir -p "$PTY_UNPACKED/build/Release"
+              cp ${nodePtyElectron}/pty.node "$PTY_UNPACKED/build/Release/pty.node"
+              # A Mach-O binary here would load-fail at runtime rather than at build time,
+              # so confirm we actually staged an ELF.
+              case "$(head -c4 "$PTY_UNPACKED/build/Release/pty.node" | od -An -tx1 | tr -d ' \n')" in
+                7f454c46) echo "[patch:18b] Overlaid Linux-native node-pty pty.node (ELF)" ;;
+                *) echo "ERROR: patch 18b — staged pty.node is not an ELF binary"; exit 1 ;;
+              esac
 
               # Copy tray icons and app icon to real filesystem (alongside ASAR)
               # COSMIC's SNI can't read from inside ASAR archives, so these must
-              # be on the real filesystem for the tray icon to display correctly.
+              # be on the real filesystem for the tray icon to display correctly
+              # (patch 08a points the resource path here on Linux).
+              # Glob every TrayIcon* family, not just TrayIconTemplate*: patch 08b selects
+              # the TrayIconLinux{,-Dark}.png assets that v1.20186.1 added, and a tray image
+              # that is merely missing renders as a blank icon with no error — so assert
+              # the files 08b names are actually present.
               mkdir -p $out/lib/claude-desktop/resources
-              for icon in extracted/resources/TrayIconTemplate*.png extracted/resources/icon.png; do
+              for icon in extracted/resources/TrayIcon*.png extracted/resources/icon.png; do
                 if [ -f "$icon" ]; then
                   cp "$icon" $out/lib/claude-desktop/resources/
+                fi
+              done
+              for required in TrayIconLinux.png TrayIconLinux-Dark.png; do
+                if [ ! -f "$out/lib/claude-desktop/resources/$required" ]; then
+                  echo "ERROR: tray icon $required missing — patch 08b selects it on Linux"; exit 1
                 fi
               done
 
