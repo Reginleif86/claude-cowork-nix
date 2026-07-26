@@ -9,9 +9,18 @@
   outputs = { self, nixpkgs, flake-utils }:
     let
       # Claude Desktop version and source
-      claudeVersion = "1.20186.1";
-      claudeDmgHash = "sha256-D4HdtSNgwOmlWDxFzJt/F0OK6A3bJgJimbuMvBTPAyQ=";
-      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/1.20186.1/Claude-df1d8a339dfabcf359af7144fe142b59ff7d9a0f.dmg";
+      claudeVersion = "1.24012.9";
+      claudeDmgHash = "sha256-JyUdlgg4BoVzEFJNT83GPj3fK/NLyoVBDr1Hf32g+SM=";
+      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/1.24012.9/Claude-03c61d06f8e01a4db2273b9514e225f21d2ba62e.dmg";
+
+      # node-pty version bundled inside the DMG's app.asar. The Linux pty.node we
+      # overlay (patch 18b) is built from this exact version — N-API keeps the ABI
+      # stable across Electron versions, but not node-pty's own JS<->native API, so
+      # a mismatched addon loads fine and then throws on a method the JS calls.
+      # Asserted against the extracted asar at build time (patch 18a); on a version
+      # bump, read node_modules/node-pty/package.json from the new DMG and update
+      # this plus the tarball hash together.
+      nodePtyVersion = "1.2.0-beta.14";
 
       supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
 
@@ -52,10 +61,10 @@
             # node_modules/node-pty/package.json). N-API keeps the *ABI* stable across
             # Electron versions, but not node-pty's own JS<->native API: a mismatched
             # pty.node loads fine and then throws on a method the JS expects.
-            version = "1.2.0-beta.13";
+            version = nodePtyVersion;
             src = pkgs.fetchurl {
-              url = "https://registry.npmjs.org/node-pty/-/node-pty-1.2.0-beta.13.tgz";
-              hash = "sha256-gnqPjagQK3EiGITsbgu2FwjvkaEx6XC2lzvkSu2Yq0U=";
+              url = "https://registry.npmjs.org/node-pty/-/node-pty-${nodePtyVersion}.tgz";
+              hash = "sha256-HACjGQuVrBY585IV15I2b9nPkSZeQaVfqxUrZTRrrvA=";
             };
             nodeAddonApi = pkgs.fetchurl {
               url = "https://registry.npmjs.org/node-addon-api/-/node-addon-api-7.1.1.tgz";
@@ -452,13 +461,82 @@
               # installPhase (patch 18b). build/Release is first in the search order and
               # is arch-agnostic, so it wins over the darwin prebuilds without needing a
               # linux-x64/linux-arm64 split.
+              # The overlaid pty.node (patch 18b) is compiled from nodePtyVersion. N-API
+              # keeps the *ABI* stable, but node-pty's own JS<->native contract changes
+              # between releases, so a drifted pair loads without error and then throws
+              # on the first method the bundled JS calls that the addon doesn't export —
+              # a runtime-only failure no regex verification would catch. Assert the
+              # DMG's bundled JS matches what we built against.
               echo "[patch:18a] Reserving node-pty build/Release in ASAR header..."
+              BUNDLED_PTY=$(${pkgs.nodejs}/bin/node -e 'process.stdout.write(require("./extracted/node_modules/node-pty/package.json").version)')
+              if [ "$BUNDLED_PTY" != "${nodePtyVersion}" ]; then
+                echo "ERROR: patch 18a — node-pty version drift."
+                echo "  DMG bundles: $BUNDLED_PTY"
+                echo "  flake builds: ${nodePtyVersion}"
+                echo "  Update nodePtyVersion (and the tarball hash) in flake.nix to match the DMG."
+                exit 1
+              fi
+              echo "[patch:18a] node-pty $BUNDLED_PTY matches the addon we build"
+              # Stage the addon so the packer can emit a real header entry for it.
+              # An empty build/Release directory is NOT enough: Electron only
+              # redirects a read into app.asar.unpacked when the header contains the
+              # *file* entry with "unpacked":true. Without it the require fails ENOENT
+              # even though the binary is sitting on disk — which is exactly how the
+              # in-app terminal broke silently (header showed `"Release":{}`).
               mkdir -p extracted/node_modules/node-pty/build/Release
+              cp ${nodePtyElectron}/pty.node extracted/node_modules/node-pty/build/Release/pty.node
               echo "[patch:18a] Done"
 
-              # Repack ASAR
+              # --- Patch 19: Bypass the macOS "disclaimer" spawn helper (regex) ---
+              # v1.24012.9 routes *every* spawnAsync through a macOS-only helper binary:
+              #   function getDisclaimerBinaryPath(){{const c=path.dirname(process.resourcesPath);
+              #                                       return path.join(c,"Helpers","disclaimer")}}
+              #   function getUntrustedLaunchOptions(o){const d=getDisclaimerBinaryPath();
+              #                                         return{cmd:d,args:[o.cmd,...o.args]}}
+              # On macOS that helper calls responsibility_spawnattrs_setdisclaim() so the
+              # child isn't attributed to Claude for TCC prompts. It ships only inside the
+              # .app bundle's Contents/Helpers, so on Linux every spawn resolves to a
+              # nonexistent path and fails ENOENT. The visible damage is login-shell
+              # environment extraction: it retries 5x and then falls back to the bare
+              # process.env, so the user's PATH and exported vars (direnv, nvm, anything
+              # from .zshrc) never reach Claude Code, MCP servers, or the terminal.
+              # Note the vestigial bare `{...}` block in getDisclaimerBinaryPath — that is
+              # a dead-code-eliminated `if(process.platform==="darwin")`, i.e. the guard
+              # existed upstream and was optimized away in the macOS build. Restore it at
+              # the wrapper instead: return the command unwrapped on non-darwin, which is
+              # exactly what upstream does where the helper is unavailable.
+              # `er()`/spawnAsync compares `rewritten.cmd !== originalCmd` to decide whether
+              # to tag errors "via disclaimer"; the pass-through keeps them equal, so spawn
+              # failures surface with their own message rather than a bogus disclaimer one.
+              # Three copies exist (main chunk + two workers) in two textual shapes —
+              # minified single-line and pretty-printed multi-line — so match in slurp
+              # mode with flexible whitespace and require the same parameter name on both
+              # `.cmd` and `.args` so only the real wrapper matches.
+              echo "[patch:19] Bypassing macOS disclaimer spawn helper..."
+              PATCH19_TARGETS="$INDEX $BUILD_DIR/shell-path-worker/shellPathWorker.js $BUILD_DIR/file-index-worker/fileIndexWorker.js"
+              for f in $PATCH19_TARGETS; do
+                if [ ! -f "$f" ]; then
+                  echo "ERROR: patch 19 — expected disclaimer call site missing: $f"; exit 1
+                fi
+                perl -0777 -i -pe 's{(function\s+([\w\$]+)\s*\(\s*([\w\$]+)\s*\)\s*\{)(\s*(?:const\s+[\w\$]+\s*=\s*[\w\$]+\(\)\s*;)?\s*return\s*\{\s*cmd\s*:\s*[\w\$]+(?:\(\))?\s*,\s*args\s*:\s*\[\s*\3\.cmd\s*,\s*\.\.\.\s*\3\.args\s*,?\s*\]\s*,?\s*\}\s*;?\s*\})}{$1if(process.platform!=="darwin")return\{cmd:$3.cmd,args:$3.args\};$4}gs' "$f"
+                grep -qP 'if\(process\.platform!=="darwin"\)return\{cmd:[\w\$]+\.cmd,args:[\w\$]+\.args\}' "$f" \
+                  || { echo "ERROR: patch 19 (disclaimer bypass) failed to apply in $f"; exit 1; }
+              done
+              # A malformed rewrite would only surface at runtime, so parse each target.
+              for f in $PATCH19_TARGETS; do
+                ${pkgs.nodejs}/bin/node --check "$f" \
+                  || { echo "ERROR: patch 19 — $f no longer parses after rewrite"; exit 1; }
+              done
+              echo "[patch:19] Done (3 call sites)"
+
+              # Repack ASAR. node-pty's addon is recorded as an unpacked entry rather
+              # than stored inline — native modules must live on the real filesystem,
+              # and the header entry is what makes Electron look for it in
+              # app.asar.unpacked (patch 18a/18b). asar-tool hard-fails if the path is
+              # missing, so a node-pty layout change can't silently drop the entry.
               echo "[5/6] Repacking ASAR..."
-              ${asarTool}/bin/asar-tool pack extracted app.asar
+              ${asarTool}/bin/asar-tool pack extracted app.asar \
+                --unpacked node_modules/node-pty/build/Release/pty.node
 
               echo "=== Build complete ==="
 
@@ -498,6 +576,32 @@
                 7f454c46) echo "[patch:18b] Overlaid Linux-native node-pty pty.node (ELF)" ;;
                 *) echo "ERROR: patch 18b — staged pty.node is not an ELF binary"; exit 1 ;;
               esac
+
+              # An ELF on disk is necessary but not sufficient: Electron reaches it only
+              # via a header entry marked "unpacked". Without that entry node-pty reports
+              # `Cannot find module './prebuilds/linux-x64/pty.node'` at runtime after
+              # silently failing build/Release — no build-time symptom whatsoever.
+              # Assert the entry exists and its recorded size matches the installed file.
+              ${pkgs.python3}/bin/python3 - "$out/lib/claude-desktop/app.asar" "$PTY_UNPACKED/build/Release/pty.node" <<'PYCHECK'
+              import json, os, struct, sys
+              asar, real = sys.argv[1], sys.argv[2]
+              with open(asar, 'rb') as f:
+                  header_size = struct.unpack('<I', f.read(16)[12:16])[0]
+                  meta = json.loads(f.read(header_size).rstrip(b'\0').decode('utf-8'))
+              node = meta
+              for part in ['node_modules', 'node-pty', 'build', 'Release', 'pty.node']:
+                  node = node.get('files', {}).get(part)
+                  if node is None:
+                      sys.exit(f"ERROR: patch 18b — ASAR header has no entry for {part} "
+                               "in node_modules/node-pty/build/Release/pty.node")
+              if not node.get('unpacked'):
+                  sys.exit("ERROR: patch 18b — pty.node header entry is not marked unpacked; "
+                           "Electron will not redirect to app.asar.unpacked")
+              actual = os.path.getsize(real)
+              if node.get('size') != actual:
+                  sys.exit(f"ERROR: patch 18b — header size {node.get('size')} != installed size {actual}")
+              print(f"[patch:18b] ASAR header records pty.node as unpacked ({actual} bytes)")
+              PYCHECK
 
               # Copy tray icons and app icon to real filesystem (alongside ASAR)
               # COSMIC's SNI can't read from inside ASAR archives, so these must

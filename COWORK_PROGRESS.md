@@ -1,20 +1,34 @@
 # Cowork on Linux - Progress Report
 
-## Current Status: v1.20186.1 — Cowork + Code/LOCAL Functional
+## Current Status: v1.24012.9 — Cowork + Code/LOCAL Functional
 
 Cowork is running on Linux via a fully declarative Nix flake. Claude Code spawns inside Cowork sessions, processes messages via the SDK wire protocol, streams responses, and persists transcripts across app restarts.
+
+**v1.24012.9 bump** — structurally quiet (every regex patch applied unchanged), but testing the *features* rather than the build surfaced three silent breakages, one of them pre-existing:
+
+- **All 17 regex patches applied unchanged.** The main process is now split into ~95 chunks (was 1), but `index.js` still requires a single entry chunk holding every patch target, so the existing discovery logic handled it with no edits.
+- **New patch 19 — the macOS "disclaimer" spawn helper.** Upstream now routes *every* `spawnAsync` through `<Contents>/Helpers/disclaimer` (macOS TCC responsibility disclaiming) with **no platform guard**; the helper only exists inside the `.app`, so on Linux every spawn ENOENTs. It never crashed — login-shell env extraction just retried 5× and fell back to bare `process.env`, so the user's PATH and exported vars (direnv, nvm, `.zshrc`) silently never reached Claude Code, MCP servers, or the terminal. Fixed; a launch log now shows `[CCD] Resolved 47 login-shell env vars` where it previously showed `Shell environment extraction failed`.
+- **node-pty version drift.** The DMG moved to `1.2.0-beta.14` while the flake still built `beta.13`. N-API keeps the ABI stable, so the mismatched addon would have loaded fine and then thrown on the first method the bundled JS called. Patch 18a now **asserts** the two match at build time, so this can't drift silently again.
+- **The in-app terminal was broken — and had been.** Chasing the node-pty bump with a real round-trip test surfaced that the `pty.node` overlay was never reachable: patch 18a reserved an *empty* `build/Release` directory in the ASAR header, but Electron only redirects a read into `app.asar.unpacked` when the header carries the **file** entry with `"unpacked": true`. With `"Release":{}` the require fell through every candidate and threw `Cannot find module './prebuilds/linux-x64/pty.node'`. The binary was on disk the whole time; nothing could reach it. `asar_tool.py pack` gained `--unpacked <relpath>`, 18b now asserts the header entry and its size, and `tests/pty-roundtrip` exercises spawn → write → read → resize → exit. This is why the earlier "PTY round-trip validated" claim should be treated as unverified for v1.20186.1.
+- **Issue #40 fixed (patch 07).** The branding relabel observed the whole document with `characterData:true`, so it rewrote user input and streamed model output — typing "for Windows" in the composer mutated it mid-keystroke. Now scoped to chrome: `childList` only, content subtrees pruned, long text ignored. Covered by `tests/branding-fix.test.js`.
+- **PTY moved to its own utility process** (`pty-host/ptyHostWorker.js`). Its path resolver branches on `app.isPackaged` and falls back to `app.getAppPath()`, which is already correct under our wrapper — no patch needed.
+- `claude-code` pin moved 2.1.205 → **2.1.219**.
+
+Validated on v1.24012.9: clean headless launch (exit 124, no `is not a function` / `Cannot find module` / `UnsafeRootError`), `[CCD] Resolved 47 login-shell env vars`, Cowork initialized via bubblewrap 0.11.0 with the VM module loaded, full PTY round-trip green (`tests/pty-roundtrip`: resolve → spawn → write/read → resize → exit code), branding-fix DOM tests green, `nix flake check` green.
+
+Not re-verified this round (needs an interactive signed-in session, not headless): Cowork session creation end-to-end, directory picker, MCP-in-session, transcript persistence.
 
 **v1.20186.1 bump** — this release changed more structurally than any previous bump:
 
 - **Main process is code-split.** `.vite/build/index.js` became an ~800-byte stub that requires `index.chunk-<hash>.js`; the entry point moved to `index.pre.js`. Every regex patch targeted `index.js`, so all of them "failed" at once. The build now discovers the chunk from index.js's `require()` (see CLAUDE.md → *Where the patches land*). The regexes themselves were almost all still correct.
 - **New hard requirement: safe-fs containment.** The app now routes contained file access (document baselines, scratch roots) through `openRootDir`/`openBeneath`/`mkdirBeneath`/`renameBeneath`/`unlinkBeneath` on `@ant/claude-native`, and **refuses to fall back to path-based opens** (CC-2885) — it throws `UnsafeRootError` at startup instead. Implemented in the Linux stub (patch 00); 12 unit tests cover the contract, including symlink-escape containment.
-- **node-pty moved to a prebuildify layout** (1.2.0-beta.13, `prebuilds/darwin-*/`) — patch 18 was reworked, and `nodePtyElectron` now tracks the bundled node-pty version.
+- **node-pty moved to a prebuildify layout** (`prebuilds/darwin-*/`) — patch 18 was reworked, and `nodePtyElectron` now tracks the bundled node-pty version.
 - **Upstream is warming to Linux.** Two patches got *retired* because upstream fixed the underlying issue, and one because the crash became structurally impossible:
   - Patch 12 (`[1m]` model suffix) — the forced suffixing is gone; `[1m]` is now an opt-in catalog entry.
   - Patch 15 — Linux is now a **first-class VM platform key**: `case"darwin":case"linux":return"unix"`, with a `files.unix.{x64,arm64}` manifest shipping a `rootfs.img`, and a `downloads.claude.ai/vms/linux/<arch>/<sha>` URL builder.
   - Tray icons: the DMG now ships real `TrayIconLinux{,-Dark}.png` assets and a GNOME-aware selection branch (patch 08b now delegates to it rather than inventing its own).
 
-Validated on v1.20186.1: clean headless launch (no `is not a function` / `Cannot find module` / `UnsafeRootError`), Cowork session created (`VM instance ready`), PTY round-trip through the Linux `pty.node` (fork → shell → output), `nix flake check` green.
+Validated on v1.20186.1: clean headless launch (no `is not a function` / `Cannot find module` / `UnsafeRootError`), Cowork session created (`VM instance ready`), `nix flake check` green. ⚠️ This section previously also claimed a PTY round-trip; that claim was **wrong** — the v1.24012.9 work proved the `pty.node` overlay was unreachable through the ASAR (see the missing `unpacked` header entry above), so the in-app terminal was broken on v1.20186.1 too.
 
 ### What Works
 
@@ -28,9 +42,9 @@ Validated on v1.20186.1: clean headless launch (no `is not a function` / `Cannot
 8. **MCP servers**: Initialize and function within Cowork sessions
 9. **Persistent auth tokens**: `--password-store=gnome-libsecret` (KDE Wallet, GNOME Keyring)
 10. **NixOS + Home Manager modules**: `programs.claude-desktop.enable`
-11. **Shell PATH augmentation**: shellPathWorker resolves login-shell env vars into the app process (`[CCD] Resolved N CC env vars from login shell`)
-12. **Code section → LOCAL mode**: works on Linux without any opt-in. `getHostPlatform()` returns `linux-x64`/`linux-arm64` natively (no throw), and CCD preseeds/uses its own Linux `claude` binary (`~/.config/Claude/claude-code/<ver>/claude` — v1.20186.1 pins 2.1.205). The `[1m]` model-suffix that used to 404 model-config requests and disable the send button is gone upstream, so patch 12 is retired. `programs.claude-desktop.claudeCodePackage` is an optional **override** (pin a specific `claude-code`) rather than a requirement.
-13. **In-app terminal / shell PTY**: Linux-native `pty.node` built against `electron_41.headers`, matching the bundled node-pty version (patch 18).
+11. **Shell PATH augmentation**: shellPathWorker resolves login-shell env vars into the app process (`[CCD] Resolved N login-shell env vars`). Requires **patch 19** as of v1.24012.9 — without it the spawn goes through the macOS-only disclaimer helper, fails ENOENT, and silently falls back to a bare `process.env`.
+12. **Code section → LOCAL mode**: works on Linux without any opt-in. `getHostPlatform()` returns `linux-x64`/`linux-arm64` natively (no throw), and CCD preseeds/uses its own Linux `claude` binary (`~/.config/Claude/claude-code/<ver>/claude` — v1.24012.9 pins 2.1.219). The `[1m]` model-suffix that used to 404 model-config requests and disable the send button is gone upstream, so patch 12 is retired. `programs.claude-desktop.claudeCodePackage` is an optional **override** (pin a specific `claude-code`) rather than a requirement.
+13. **In-app terminal / shell PTY**: Linux-native `pty.node` built against `electron_41.headers`, matching the bundled node-pty version, and reachable through the ASAR via an `unpacked` header entry (patch 18). Covered by `tests/pty-roundtrip`.
 
 ### Known Limitations
 
@@ -99,4 +113,4 @@ User sends message in Cowork UI
 ---
 
 **Last Updated**: 2026-07-13
-**Claude Desktop Version**: 1.20186.1
+**Claude Desktop Version**: 1.24012.9

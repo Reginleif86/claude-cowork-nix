@@ -107,11 +107,22 @@ def create_header_from_directory(dir_path):
 
     return build_node(dir_path)
 
-def pack_asar(source_dir, output_path):
-    """Pack directory into ASAR archive"""
+def pack_asar(source_dir, output_path, unpacked_paths=()):
+    """Pack directory into ASAR archive
+
+    unpacked_paths: source-dir-relative POSIX paths to record as {"size":N,
+    "unpacked":true} instead of storing inline. Electron only redirects a read
+    to <output>.unpacked/<path> when such a header entry exists -- an empty
+    directory in the header is NOT enough, the file entry itself must be there
+    or the require fails ENOENT. The caller is responsible for placing the
+    actual bytes in <output>.unpacked/<path>.
+    """
     # Build header structure
     print("Building header...")
     header = create_header_from_directory(source_dir)
+
+    unpacked_set = set(unpacked_paths)
+    unpacked_seen = set()
 
     # Collect all files and assign offsets
     files_data = []
@@ -125,6 +136,16 @@ def pack_asar(source_dir, output_path):
                     assign_offsets(info)
                 elif '_file_path' in info:
                     file_path = info['_file_path']
+                    rel = os.path.relpath(file_path, source_dir).replace(os.sep, '/')
+
+                    if rel in unpacked_set:
+                        info['size'] = os.path.getsize(file_path)
+                        info['unpacked'] = True
+                        del info['_file_path']
+                        unpacked_seen.add(rel)
+                        print(f"Unpacked: {rel} (size={info['size']}, stored outside archive)")
+                        continue
+
                     with open(file_path, 'rb') as f:
                         data = f.read()
 
@@ -138,6 +159,15 @@ def pack_asar(source_dir, output_path):
                     print(f"Adding: {file_path} (offset={info['offset']}, size={info['size']})")
 
     assign_offsets(header)
+
+    # A requested path that never matched means the layout moved; failing here
+    # beats shipping an archive whose native module silently cannot be found.
+    missing = unpacked_set - unpacked_seen
+    if missing:
+        raise SystemExit(
+            "ERROR: --unpacked path(s) not found under "
+            f"{source_dir}: {', '.join(sorted(missing))}"
+        )
 
     # Serialize header
     header_json = json.dumps(header, separators=(',', ':')).encode('utf-8')
@@ -185,7 +215,7 @@ if __name__ == '__main__':
     if len(sys.argv) < 2:
         print("Usage:")
         print("  Extract: python3 asar_tool.py extract <asar_file> <output_dir>")
-        print("  Pack:    python3 asar_tool.py pack <source_dir> <output_asar>")
+        print("  Pack:    python3 asar_tool.py pack <source_dir> <output_asar> [--unpacked <relpath>]...")
         sys.exit(1)
 
     command = sys.argv[1]
@@ -197,10 +227,23 @@ if __name__ == '__main__':
         extract_asar(sys.argv[2], sys.argv[3])
 
     elif command == 'pack':
-        if len(sys.argv) != 4:
-            print("Pack usage: python3 asar_tool.py pack <source_dir> <output_asar>")
+        if len(sys.argv) < 4:
+            print("Pack usage: python3 asar_tool.py pack <source_dir> <output_asar> [--unpacked <relpath>]...")
             sys.exit(1)
-        pack_asar(sys.argv[2], sys.argv[3])
+        rest = sys.argv[4:]
+        unpacked = []
+        i = 0
+        while i < len(rest):
+            if rest[i] == '--unpacked':
+                if i + 1 >= len(rest):
+                    print("--unpacked requires a path argument")
+                    sys.exit(1)
+                unpacked.append(rest[i + 1].replace(os.sep, '/'))
+                i += 2
+            else:
+                print(f"Unknown pack option: {rest[i]}")
+                sys.exit(1)
+        pack_asar(sys.argv[2], sys.argv[3], unpacked)
 
     else:
         print(f"Unknown command: {command}")

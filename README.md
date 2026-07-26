@@ -212,21 +212,25 @@ macOS DMG (fetchurl)
   asar_tool.py extract -> raw JS
        |
   15 patches:
-    00: Native module stub (@ant/claude-native + AuthRequest)
+    00: Native module stub (@ant/claude-native, incl. safe-fs containment API)
     01: Cowork module loader (claude-cowork-linux)
-    02: Platform flag (route Linux through TypeScript VM path)
+    02: [retired v1.13576.4 — role absorbed by 03 + 06]
     03: Availability check (return "supported" for Linux)
     04: Skip bundle download (short-circuit on Linux)
     05: VM start intercept (Linux session with spawn, writeStdin, mounts)
     06: VM getter override (return Linux VM instance)
-    07: Platform branding ("for Linux" in UI)
-    08: Tray icon (theme-aware PNGs for Linux)
+    07: Platform branding ("for Linux" in UI chrome only)
+    08: Tray icon (real FS path + theme-aware Linux PNGs)
     09: DBus tray cleanup delay (stability fix)
     11: shellPathWorker resolution (use process.argv[1], not resourcesPath)
-    12: [1m] model-suffix neutralization (unblocks Code/LOCAL send button)
-    13: getHostPlatform Linux return (stops "Unsupported platform: linux-x64" throw)
+    12: [retired v1.20186.1 — asserts no forced [1m] suffixer returns]
+    13: [retired v1.13576.4 — asserts native getHostPlatform Linux branch]
     14: CLAUDE_CODE_LOCAL_BINARY constructor wiring (restored in v1.6608.x)
-    15: VM bundle file lookup Linux fallback (silences getDownloadStatus startup error)
+    15: [retired v1.13576.4 — asserts linux->files.unix bundle mapping]
+    16: Guard macOS-fork-only Electron startup APIs (setUserDefault, configureWebAuthn)
+    17: Guard macOS-only BrowserWindow chrome APIs (traffic lights, Mission Control)
+    18: Linux-native node-pty pty.node overlay (in-app terminal/shell PTY)
+    19: Bypass macOS "disclaimer" spawn helper (restores login-shell env extraction)
        |
   asar_tool.py pack -> patched app.asar
        |
@@ -251,6 +255,8 @@ Claude Desktop has two VM paths: macOS via `@ant/claude-swift` (Swift native mod
 ├── tools/
 │   ├── asar_tool.py                  # ASAR archive extract/pack
 │   └── icns_extract.py               # macOS icon extraction
+├── tests/
+│   └── branding-fix.test.js          # DOM harness for patch 07 scoping (issue #40)
 └── examples/                         # NixOS/Home Manager config examples
 ```
 
