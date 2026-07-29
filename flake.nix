@@ -529,6 +529,32 @@
               done
               echo "[patch:19] Done (3 call sites)"
 
+              # --- Patch 20: Linux single-instance + claude:// deep-link delivery ---
+              # v1.24012.9 dropped the non-darwin arm of the deep-link setup (see the
+              # header comment in scripts/linux-deep-link.js for the before/after). The
+              # handlers it still registers — open-url, will-continue-activity,
+              # continue-activity — are all macOS-only events, so on Linux no claude://
+              # URL is ever consumed and OAuth sign-in cannot complete: the callback
+              # launches a second instance whose argv is never read.
+              # Appended rather than substituted because there is no surviving call site
+              # to rewrite — the arm is gone, not renamed. The script re-emits the app's
+              # own "open-url" listener instead of reimplementing dispatch, so it stays
+              # version-agnostic as long as that listener exists, which is what the
+              # first assertion pins. The second assertion is the drop-this-patch
+              # tripwire for when upstream restores the arm itself.
+              echo "[patch:20] Restoring Linux deep-link handling..."
+              grep -qP 'app\.on\("open-url"' "$INDEX" \
+                || { echo "ERROR: patch 20 — no app.on(\"open-url\") listener in $INDEX; the dispatch this patch re-emits into is gone, re-derive"; exit 1; }
+              if grep -q 'requestSingleInstanceLock' "$INDEX"; then
+                echo "ERROR: patch 20 — the app requests a single-instance lock again; upstream likely restored the non-darwin arm, so drop this patch"; exit 1
+              fi
+              cat ${./scripts/linux-deep-link.js} >> "$INDEX"
+              grep -qP 'requestSingleInstanceLock' "$INDEX" \
+                || { echo "ERROR: patch 20 (deep-link handling) failed to apply"; exit 1; }
+              ${pkgs.nodejs}/bin/node --check "$INDEX" \
+                || { echo "ERROR: patch 20 — $INDEX no longer parses after append"; exit 1; }
+              echo "[patch:20] Done"
+
               # Repack ASAR. node-pty's addon is recorded as an unpacked entry rather
               # than stored inline — native modules must live on the real filesystem,
               # and the header entry is what makes Electron look for it in

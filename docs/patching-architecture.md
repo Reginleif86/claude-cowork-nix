@@ -8,7 +8,7 @@ A **hybrid** strategy combining inline `perl -pe` regex substitutions with a dyn
 
 - **9 regex patches** (02, 03, 04, 06a, 06b, 08a, 08b, 09, 11, 12) use `perl -pe` with `\w+` wildcards for minified identifiers, applied directly in the Nix build phase
 - **1 dynamic patch** (05) uses a Node.js script that discovers the VM start function by its `[VM:start]` log string, then injects the Linux session block
-- **2 file-based patches** (00, 01, 07) append or copy standalone JavaScript files
+- **file-based patches** (00, 01, 07, 20) append or copy standalone JavaScript files
 - Each regex patch is verified with a `grep -qP` post-check that fails the build on mismatch
 
 This approach has survived across v1.1.2685, v1.1.3770, v1.1348.0, v1.1617.0, and v1.2278.0 (including a major versioning scheme change) without requiring patch rewrites for most patches. The v1.2278.0 bump needed one narrow fix: patch 03's function-name capture widened from `\w+` to `[\w\$]+` because Anthropic's minifier produced `J$n` (with a literal `$`) for the target function.
@@ -85,6 +85,59 @@ Patch 12 alone isn't sufficient for LOCAL mode — the CCD daemon also throws `U
 2. **New chat-send call sites await `Ta.prepare()`.** v1.6608.2 added code paths around offsets 10478043 (`const De=await Ta.prepare(); be=(De.ready?De.path:null)??await Ta.getBinaryPathIfReady()`) and 11476159 (`const i=await Ta.getBinaryPathIfReady(); if(!i)throw...`) that propagate the synchronous `getHostPlatform` throw into the chat UI. This surfaces in **Cowork** even when `claudeCodePackage` is unset, because Cowork's send pipeline now opportunistically probes for a host claude-code binary. **Patch 13** is the defensive fix: instead of throwing, `getHostPlatform()` returns the appropriate `linux-x64` / `linux-arm64` string. `getHostTarget()` then resolves cleanly, `binaryExistsForTarget` returns false (no binary on disk), and callers handle the null fallback gracefully.
 
 Together, patch 13 keeps Cowork (and any non-LOCAL feature that incidentally probes CCD) functional with no env var; patch 14 reactivates the LOCAL escape hatch for users who opt in via `claudeCodePackage`.
+
+## Linux deep-link delivery (patch 20)
+
+Through v1.9255.2 the main process branched on platform when wiring up deep links:
+
+```javascript
+isMac ? (app.on("open-url", …), app.on("continue-activity", …))
+      : app.requestSingleInstanceLock()
+          ? app.on("second-instance", (e, argv) => { focus(); dispatch(argv) })
+          : app.quit();
+```
+
+**v1.24012.9 dropped the non-darwin arm.** It now registers `open-url`,
+`will-continue-activity` and `continue-activity` unconditionally — and all three are
+macOS-only Electron events. On Linux the consequences are:
+
+1. No single-instance lock, so every `claude-desktop claude://…` invocation (i.e. every
+   `xdg-open` of the scheme handler) starts a second full app against one `--user-data-dir`.
+2. The URL sits unread in that process's argv. There is no cold-start argv scan for the
+   scheme either, so it is silently dropped.
+
+This breaks OAuth sign-in outright: the app hands off to the system browser (its
+in-process path, `ASWebAuthenticationSession`, is macOS-only), and the
+`claude://login/…` callback never gets back in. The user sees a new window still showing
+the stale "sign in again" banner, with no way to ever clear it.
+
+`scripts/linux-deep-link.js` restores the missing arm. It deliberately does **not**
+reimplement dispatch — the app's own `open-url` listener already owns mainView readiness,
+the pending-URL stash for pre-ready arrivals, and window focus — so the patch just
+re-emits that event:
+
+```javascript
+app.emit("open-url", { preventDefault() {} }, url);
+```
+
+Keeping the app as the single owner of URL handling is what makes this cheap to carry
+across version bumps: the only structural assumption is that an `app.on("open-url")`
+listener exists, which the build-time assertion pins.
+
+Two details worth preserving if this is ever rewritten:
+
+- **`app.exit(0)`, not `app.quit()`, for the losing instance.** The script is appended to
+  the end of the chunk, so by then the app has registered its `onQuitCleanup` handlers;
+  `app.quit()` runs them, including `flush-web-storage` and `plan-usage-history`, which
+  write into the profile the *primary* owns. A process that should never have started
+  must not touch shared state on its way out.
+- **The handoff is already done when the lock call returns.** Chromium's `ProcessSingleton`
+  notifies the primary and waits for the ack inside `requestSingleInstanceLock()`, so
+  exiting immediately afterwards loses nothing.
+
+The second assertion in the build (`requestSingleInstanceLock` must be *absent* before
+appending) is a tripwire: if a future release restores the arm itself, the build fails
+loudly rather than installing two competing single-instance handlers.
 
 ## Wrapped-Electron Path Resolution Gotcha
 
