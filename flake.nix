@@ -9,9 +9,9 @@
   outputs = { self, nixpkgs, flake-utils }:
     let
       # Claude Desktop version and source
-      claudeVersion = "1.24012.9";
-      claudeDmgHash = "sha256-JyUdlgg4BoVzEFJNT83GPj3fK/NLyoVBDr1Hf32g+SM=";
-      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/1.24012.9/Claude-03c61d06f8e01a4db2273b9514e225f21d2ba62e.dmg";
+      claudeVersion = "1.24012.11";
+      claudeDmgHash = "sha256-K3jbOMCBbaSeC0HSSBan7OPI15im/AADiTohlSEnG64=";
+      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/1.24012.11/Claude-09114b681f6f333d10cf1a08df130fe7080ddc9b.dmg";
 
       # node-pty version bundled inside the DMG's app.asar. The Linux pty.node we
       # overlay (patch 18b) is built from this exact version — N-API keeps the ABI
