@@ -336,6 +336,53 @@ class ClaudeNativeLinux {
     return null;
   }
 
+  // --- DeviceRegistry hardware key (v1.26832.0) ---
+  //
+  // The app signs a device-attestation preimage with a key the native module owns.
+  // On macOS that key lives in the Secure Enclave. Without these two methods the
+  // renderer's DeviceRegistry.signAttestationPreimage IPC handler throws
+  // `TypeError: r.hardwareKeyGetOrCreate is not a function` on a retry loop —
+  // and it cannot fall back, because the DEV software-key escape hatch is compiled
+  // out of release builds (its guard is a literal `return !1`).
+  //
+  // The contract is fixed by how the return values are consumed:
+  //   hardwareKeyGetOrCreate(alias) -> { isHardwareBacked, publicKeySpki }
+  //       publicKeySpki is a Buffer; the app calls .toString("base64") on it, so it
+  //       must be DER SPKI, matching the DEV path's export({type:"spki",format:"der"}).
+  //   hardwareKeySign(alias, data)  -> Buffer, a DER ECDSA signature
+  //       The app pipes it through a strict DER parser that requires
+  //       SEQUENCE{INTEGER r, INTEGER s} with r/s of 1..33 bytes, then left-pads each
+  //       to 32 to build P1363 — so the curve must be P-256 and the encoding DER.
+  //
+  // `isHardwareBacked: false` is reported honestly. This is not a spoof of hardware
+  // attestation: the app models exactly this state, tagging the device
+  // `software_shim` (vs `hardware_backed` / `unavailable`) and exposing a `no_tpm`
+  // availability reason. Claiming true would misreport the device's security posture
+  // to the server; false is the truthful answer for a software key.
+  //
+  // The key is persisted, not per-launch: a device identity that changed on every
+  // start would defeat the point of a device registry. Stored 0600 in a 0700 dir
+  // under userData, keyed by a hash of the alias so an alias can never influence the
+  // path. Creation uses O_EXCL so two racing processes converge on one key.
+  hardwareKeyGetOrCreate(alias) {
+    const key = loadOrCreateDeviceKey(alias);
+    return {
+      isHardwareBacked: false,
+      publicKeySpki: require('crypto')
+        .createPublicKey(key)
+        .export({ type: 'spki', format: 'der' }),
+    };
+  }
+
+  hardwareKeySign(alias, data) {
+    const crypto = require('crypto');
+    const key = loadOrCreateDeviceKey(alias);
+    const payload = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    // dsaEncoding is explicit: Node defaults EC signatures to DER, but the app's
+    // parser rejects the 'ieee-p1363' form outright, so don't leave it to a default.
+    return crypto.sign('sha256', payload, { key, dsaEncoding: 'der' });
+  }
+
   // System theme detection
   getSystemTheme() {
     const nativeTheme = require('electron').nativeTheme;
@@ -348,6 +395,43 @@ class ClaudeNativeLinux {
       callback(nativeTheme.shouldUseDarkColors ? 'dark' : 'light');
     });
   }
+}
+
+// Backing store for the DeviceRegistry key (see hardwareKeyGetOrCreate above).
+// Kept out of the class so the key material never becomes an enumerable property
+// of the module object the app holds a reference to.
+function deviceKeyPath(alias) {
+  const crypto = require('crypto');
+  const dir = path.join(app.getPath('userData'), 'device-keys');
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // Hash rather than sanitize: the alias is caller-supplied and ends up in a path.
+  const name = crypto.createHash('sha256').update(String(alias)).digest('hex');
+  return path.join(dir, `${name}.pem`);
+}
+
+function loadOrCreateDeviceKey(alias) {
+  const crypto = require('crypto');
+  const file = deviceKeyPath(alias);
+
+  try {
+    return crypto.createPrivateKey(fs.readFileSync(file, 'utf8'));
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+
+  const { privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const pem = privateKey.export({ type: 'pkcs8', format: 'pem' });
+  try {
+    fs.writeFileSync(file, pem, { mode: 0o600, flag: 'wx' });
+  } catch (err) {
+    // Another process won the race — adopt its key rather than overwrite, or the
+    // two would disagree about the device identity.
+    if (err.code === 'EEXIST') {
+      return crypto.createPrivateKey(fs.readFileSync(file, 'utf8'));
+    }
+    throw err;
+  }
+  return privateKey;
 }
 
 // AuthRequest stub - returns isAvailable()=false so the app falls back to

@@ -1,8 +1,22 @@
 # Cowork on Linux - Progress Report
 
-## Current Status: v1.24012.9 — Cowork + Code/LOCAL Functional
+## Current Status: v1.26832.0 — Cowork + Code/LOCAL Functional
 
 Cowork is running on Linux via a fully declarative Nix flake. Claude Code spawns inside Cowork sessions, processes messages via the SDK wire protocol, streams responses, and persists transcripts across app restarts.
+
+**v1.26832.0 bump** — the loudest structural bump so far. Two independent, simultaneous changes broke nearly the whole chain, and a third class of bug was found by launching rather than building:
+
+- **The main process shattered.** `index.js` went from an ~800-byte stub with one `require()` to a 242 KB module requiring 159 of ~350 chunks, and the patch targets scattered across at least seven files. "Resolve the first require" — the discovery rule since v1.20186.1 — now lands on an unrelated 1.7 KB chunk. Patches are keyed on **anchors** now: `apply_patch` greps the tree, rewrites every file holding the anchor, and fails if the anchor is missing or the rewrite lands nowhere. Upstream re-chunking is a no-op for us from here.
+- **The minifier changed shape twice over.** Every string literal became a backtick template literal, and `const` became `let`. That alone broke every regex matching a quoted string — i.e. all of them except patch 14, the only one that matches no string literal. Regexes now use ``[`"]`` and `(?:const|let)` throughout so a flip back costs nothing.
+- **`{}` is truthy — two subsystems silently ran their macOS backend on Linux.** `@ant/claude-swift` exports `{}` on non-darwin, so `await import(...)` *succeeds* and every upstream `if (swiftModule)` check passes. The notification service took the Swift branch and threw `TypeError: e.on is not a function` (**patch 20**), leaving `useSwiftNotifications=true` with no working backend — desktop notifications never reached the Electron path that works on Linux. The VM module loader did `new Proxy(undefined, …)` and threw `Cannot create proxy with a non-object as target or handler` (**patch 21**). Both were *caught*: the window opened normally, the exit code was clean, and every existing grep passed. They showed up only as two Sentry events per launch. Sentry-event count is now a documented test signal, and it is 0.
+- **Patches 06b and 09 retired.** 09's pattern is gone upstream *and* its payload was inert (an empty `setTimeout` delays nothing). 06b widened a getter that may only ever return null or a real EventEmitter — on Linux the module is `{}`, which is neither; with patch 21 the getter yields null either way, so the widening was provably dead. Both had the same failure mode the repo keeps hitting: a patch that applies (or silently doesn't) while doing nothing.
+- **Post-patch syntax sweep.** All 357 build files are `node --check`ed after patching. A brace-mangling regex greps clean and only fails at runtime, inside a subsystem that may well catch and degrade.
+- **Patch 19 site count changed** (3 → 2; the `shellPathWorker` copy is gone) and **patch 05's signature drifted** (`var` → `let` declarations, dotted status-dispatch enum). Both are now discovered rather than hardcoded.
+- `claude-code` pin moved 2.1.219 → **2.1.222**. node-pty stayed at `1.2.0-beta.14`.
+
+Validated on v1.26832.0: clean headless launch (exit 124), **0 Sentry events**, `NotificationService initialized with Electron notifications`, `[CCD] Resolved 47 login-shell env vars`, Cowork initialized via bubblewrap 0.11.0, full PTY round-trip green (`tests/pty-roundtrip`), branding-fix DOM tests green (13/13), `nix flake check` green. Remaining log noise is the documented benign set (logged-out `accountId=null`, `[wake-scheduler] DEV BUILD`, `@ant/claude-swift unavailable` pressure telemetry, hCaptcha permission denials on the login page).
+
+Not re-verified this round (needs an interactive signed-in session, not headless): Cowork session creation end-to-end, directory picker, MCP-in-session, transcript persistence.
 
 **v1.24012.9 bump** — structurally quiet (every regex patch applied unchanged), but testing the *features* rather than the build surfaced three silent breakages, one of them pre-existing:
 
@@ -112,5 +126,5 @@ User sends message in Cowork UI
 
 ---
 
-**Last Updated**: 2026-07-13
-**Claude Desktop Version**: 1.24012.9
+**Last Updated**: 2026-08-10
+**Claude Desktop Version**: 1.26832.0

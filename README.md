@@ -3,7 +3,7 @@
 [![Nix Flake](https://img.shields.io/badge/Nix-Flake-5277C3?logo=nixos&logoColor=white)](https://github.com/Reginleif88/claude-cowork-nix)
 [![Platform](https://img.shields.io/badge/Platform-Linux-blue?logo=linux&logoColor=white)](https://github.com/Reginleif88/claude-cowork-nix)
 [![License](https://img.shields.io/badge/License-Apache--2.0%20OR%20MIT-blue)](./LICENSE-APACHE)
-[![Claude Desktop](https://img.shields.io/badge/Claude_Desktop-v1.9255.2-1dc8f7)](https://claude.ai)
+[![Claude Desktop](https://img.shields.io/badge/Claude_Desktop-v1.26832.0-1dc8f7)](https://claude.ai)
 [![Cowork](https://img.shields.io/badge/Cowork-Enabled-green)](./COWORK_PROGRESS.md)
 
 Fully declarative NixOS package for Claude Desktop on Linux with Cowork support. Extracts from the macOS DMG, patches for Linux compatibility, and wraps with Electron 41.
@@ -89,9 +89,12 @@ The in-app "Code" section has four sub-modes (LOCAL, SSH, Cloud Environment, Rem
 
 Anthropic's CCD daemon has an undocumented escape hatch: if `CLAUDE_CODE_LOCAL_BINARY` is set to a valid executable path, *every* CCD entry point (`getStatus`, `prepare`, `getBinaryPathIfReady`, `prepareForVM`) short-circuits before the `getHostPlatform` throw. The `claudeCodePackage` option wires this env var into the Electron wrapper at build time.
 
-In v1.6608.2 Anthropic minified the constructor's env-var bridge into a dead expression, breaking the escape hatch on disk. **Patch 14** restores the original constructor wiring (`process.env.CLAUDE_CODE_LOCAL_BINARY && (this.localBinaryInitPromise = this.initLocalBinary(env))`), so `claudeCodePackage` works again. **Patch 13** is a defensive belt-and-braces fix: it makes `getHostPlatform()` return `linux-x64`/`linux-arm64` instead of throwing — needed because v1.6608.2 also added new send-pipeline call sites that `await Ta.prepare()` from Cowork chats, which would otherwise crash with "Something went wrong / Unsupported platform: linux-x64" even when `claudeCodePackage` is unset.
+In v1.6608.2 Anthropic minified the constructor's env-var bridge into a dead expression, breaking the escape hatch on disk. **Patch 14** restores the original constructor wiring (`process.env.CLAUDE_CODE_LOCAL_BINARY && (this.localBinaryInitPromise = this.initLocalBinary(env))`), so `claudeCodePackage` works again.
 
-Patch 12 additionally neutralizes an Anthropic GrowthBook feature flag (`3885610113`) that would otherwise append `[1m]` to Opus/Sonnet model IDs, causing `model_configs/claude-opus-4-6[1m]` 404s that disable the send button. Patch 12 applies unconditionally — you get the fix whether or not you opt into LOCAL mode.
+Two problems that used to need patches here are now fixed upstream, so the patches became build-time assertions rather than rewrites — they fail the build loudly if the upstream fix ever regresses:
+
+- **Patch 13** (`getHostPlatform()` throwing `Unsupported platform: linux-x64`): since v1.13576.4 the function ships a native `linux-x64`/`linux-arm64` branch.
+- **Patch 12** (`[1m]` force-appended to Opus/Sonnet model IDs, 404ing `model_configs` and disabling the send button): since v1.20186.1 upstream no longer force-appends the suffix. It survives only in the model *catalog*, which offers a 1M-context variant as a separate, opt-in entry — which is the intended behaviour.
 
 ### Three ways to provide a claude-code binary
 
@@ -211,17 +214,19 @@ macOS DMG (fetchurl)
        |
   asar_tool.py extract -> raw JS
        |
-  15 patches:
+  16 active patches (anchor-keyed: each is located by grepping the
+  build tree for its target, not by filename — upstream re-chunks often):
     00: Native module stub (@ant/claude-native, incl. safe-fs containment API)
     01: Cowork module loader (claude-cowork-linux)
     02: [retired v1.13576.4 — role absorbed by 03 + 06]
     03: Availability check (return "supported" for Linux)
     04: Skip bundle download (short-circuit on Linux)
     05: VM start intercept (Linux session with spawn, writeStdin, mounts)
-    06: VM getter override (return Linux VM instance)
+    06a: VM getter override (async getter + sync .getCached, must agree)
+    06b: [retired v1.26832.0 — getter must yield null or a real EventEmitter]
     07: Platform branding ("for Linux" in UI chrome only)
     08: Tray icon (real FS path + theme-aware Linux PNGs)
-    09: DBus tray cleanup delay (stability fix)
+    09: [retired v1.26832.0 — pattern gone upstream, payload was inert]
     11: shellPathWorker resolution (use process.argv[1], not resourcesPath)
     12: [retired v1.20186.1 — asserts no forced [1m] suffixer returns]
     13: [retired v1.13576.4 — asserts native getHostPlatform Linux branch]
@@ -231,13 +236,18 @@ macOS DMG (fetchurl)
     17: Guard macOS-only BrowserWindow chrome APIs (traffic lights, Mission Control)
     18: Linux-native node-pty pty.node overlay (in-app terminal/shell PTY)
     19: Bypass macOS "disclaimer" spawn helper (restores login-shell env extraction)
+    20: Don't engage the Swift notification backend on Linux (@ant/claude-swift
+        exports {} off darwin, which is truthy — desktop notifications were dead)
+    21: Same for the Swift VM module loader (new Proxy(undefined) → Sentry spam)
+       |
+  node --check every build file (a brace-mangling regex greps clean)
        |
   asar_tool.py pack -> patched app.asar
        |
   electron_41 + makeWrapper + buildFHSEnv -> claude-desktop
 ```
 
-Claude Desktop has two VM paths: macOS via `@ant/claude-swift` (Swift native module) and Windows via a TypeScript VM client over IPC sockets. By setting the platform flag (patch 02), Linux routes through the TypeScript path. The VM start function (patch 05) creates a Linux session that spawns Claude Code directly on the host, translates VM-internal paths to real host paths, and manages process I/O via the SDK wire protocol.
+Claude Desktop's VM support is macOS-native via `@ant/claude-swift` (a Swift native module). There is no VM-implementation switch to flip any more — the old Windows TypeScript-client selection was inlined away in v1.13576.4, which is why patch 02 is retired. Instead, Linux is marked available (patch 03), the macOS VM bundle download is skipped (patch 04), and the VM start function (patch 05) creates a Linux session that spawns Claude Code directly on the host, translates VM-internal paths to real host paths, and manages process I/O via the SDK wire protocol. The VM getters (patch 06a) then hand that session to the app in place of the Swift VM.
 
 ## Project Structure
 

@@ -13,14 +13,22 @@ const path = require('path');
 
 const EXTRACTED_DIR = process.argv[2] || '/tmp/app-extracted';
 
-// The main process is code-split as of v1.20186.1: index.js is a stub that requires
-// index.chunk-<hash>.js, where the app code (and this patch's target) now lives. The
-// caller passes the resolved file; standalone runs re-derive it from index.js.
+// The main process is code-split. Up to v1.24012.9 index.js required exactly one
+// entry chunk that held every patch target, so "first require wins" resolved it.
+// v1.26832.0 fans out across ~350 sibling chunks and index.js requires 159 of them,
+// so that heuristic now lands on an unrelated 1.7 KB chunk. Locate the file by the
+// [VM:start] log string instead — the anchor this patch keys on anyway.
+// The caller normally passes the resolved file; standalone runs re-derive it.
 const INDEX_JS_PATH = process.argv[3] || (() => {
   const buildDir = path.join(EXTRACTED_DIR, '.vite/build');
-  const entry = path.join(buildDir, 'index.js');
-  const chunk = /require\("\.\/(index\.chunk-[\w-]+\.js)"\)/.exec(fs.readFileSync(entry, 'utf8'));
-  return chunk ? path.join(buildDir, chunk[1]) : entry;
+  const hit = fs.readdirSync(buildDir)
+    .filter((f) => f.endsWith('.js'))
+    .find((f) => fs.readFileSync(path.join(buildDir, f), 'utf8').includes('[VM:start]'));
+  if (!hit) {
+    console.error('  ERROR: no build file contains the [VM:start] anchor');
+    process.exit(1);
+  }
+  return path.join(buildDir, hit);
 })();
 
 console.log('=== Dynamic Patch: VM Start Intercept ===\n');
@@ -28,12 +36,14 @@ console.log('=== Dynamic Patch: VM Start Intercept ===\n');
 let content = fs.readFileSync(INDEX_JS_PATH, 'utf8');
 
 // Discover function signature by matching the stable pattern:
-//   async function WORD(WORD,WORD,WORD,WORD){var WORD,...; <arbitrary setup>; WORD.info(`[VM:start]
+//   async function WORD(WORD,WORD,WORD,WORD){<decl>; <arbitrary setup>; WORD.info(`[VM:start]
 // The arbitrary-setup window covers version-to-version drift such as the
 // condadata.* / operon-* cleanup loops added in v1.6608.x. The capture is
-// anchored on the function header + var declarations + first [VM:start] log
+// anchored on the function header + leading declaration + first [VM:start] log
 // call, which together produce a unique substring suitable for `replace()`.
-const sigRegex = /async function (\w+)\((\w+),(\w+),(\w+),(\w+)\)\{(var \w+(?:,\w+)*;.{0,4000}?\w+\.info\(`\[VM:start\])/;
+// The declaration keyword must stay a wildcard: through v1.24012.9 the minifier
+// emitted bare hoisted `var a,b;`, v1.26832.0 emits `let a=f(),b=Date.now(),...`.
+const sigRegex = /async function (\w+)\((\w+),(\w+),(\w+),(\w+)\)\{((?:var|let|const) [\s\S]{0,4000}?\w+\.info\(`\[VM:start\])/;
 const sigMatch = content.match(sigRegex);
 
 if (!sigMatch) {
@@ -48,9 +58,12 @@ const originalBody = sigMatch[6];
 console.log(`  Found VM start function: ${funcName}(${params.join(',')})`);
 
 // Discover status dispatch: WORD(WORD.Ready) near VM startup code
-// Look for patterns like YF(Yw.Ready) or similar near [Heartbeat] or lam_vm_startup
-const statusRegex1 = /([\w$]+)\(([\w$]+)\.Ready\),[\w$]+\("lam_vm_startup_completed"/;
-const statusRegex2 = /([\w$]+)\(([\w$]+)\.Ready\).{0,100}\[Heartbeat\]/;
+// Look for patterns like YF(Yw.Ready) or similar near [Heartbeat] or lam_vm_startup.
+// The enum reference must allow dots — v1.26832.0 reaches it through a re-exported
+// namespace (`Y(s.d.Ready)`) rather than a local binding — and string literals must
+// allow backticks, since that build minifies every string to a template literal.
+const statusRegex1 = /([\w$]+)\(([\w$.]+)\.Ready\),[\w$]+\([`"]lam_vm_startup_completed[`"]/;
+const statusRegex2 = /([\w$]+)\(([\w$.]+)\.Ready\)[\s\S]{0,100}\[Heartbeat\]/;
 const statusMatch = content.match(statusRegex1) || content.match(statusRegex2);
 
 let statusDispatch = 'console.log("[Cowork Linux] Ready")';

@@ -9,9 +9,9 @@
   outputs = { self, nixpkgs, flake-utils }:
     let
       # Claude Desktop version and source
-      claudeVersion = "1.24012.9";
-      claudeDmgHash = "sha256-JyUdlgg4BoVzEFJNT83GPj3fK/NLyoVBDr1Hf32g+SM=";
-      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/1.24012.9/Claude-03c61d06f8e01a4db2273b9514e225f21d2ba62e.dmg";
+      claudeVersion = "1.26832.0";
+      claudeDmgHash = "sha256-fUcfeYc3dxc98HceNuybRMshC13Hlv1se1KbSIMOtdc=";
+      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/1.26832.0/Claude-056ee2be623b207f6a4d24dfb1b2fb5a82db0ecf.dmg";
 
       # node-pty version bundled inside the DMG's app.asar. The Linux pty.node we
       # overlay (patch 18b) is built from this exact version — N-API keeps the ABI
@@ -189,26 +189,71 @@
               # Apply patches (version-resilient regex + dynamic discovery)
               echo "[4/6] Applying patches..."
 
-              # v1.20186.1 code-split the Electron main process. The load chain is:
+              # v1.20186.1 code-split the Electron main process; v1.26832.0 shattered it.
+              # The load chain is now:
               #   package.json main -> .vite/build/index.pre.js  (Sentry bootstrap +
               #                                                    launch-failure dialog)
-              #     -> require("./index.js")                     (~800-byte stub)
-              #       -> require("./index.chunk-<hash>.js")      (4.4 MB — the app code
-              #                                                    formerly in index.js)
-              # Every patch target below lives in that chunk. Its hash is content-derived
-              # and changes on each release, so resolve it from index.js's require()
-              # rather than hardcoding. Older monolithic builds have no such require and
-              # fall back to index.js itself.
+              #     -> require("./index.js")                     (242 KB, requires 159 chunks)
+              #       -> index{,2}.chunk-<hash>.js               (~350 files, 14 MB total)
+              #
+              # Through v1.24012.9 index.js was an ~800-byte stub with a single require()
+              # and that one chunk held every patch target, so "resolve the first require"
+              # found it. That is no longer true on either count: index.js is itself a
+              # large module holding several targets, and the rest are spread over at
+              # least seven sibling chunks. Resolving "the first require" now lands on an
+              # unrelated 1.7 KB chunk, which would make every regex patch fail at once.
+              #
+              # So don't resolve a file at all — resolve each patch's *anchor*. apply_patch
+              # greps the whole build tree for the anchor, rewrites every file that has it,
+              # and fails if the anchor is missing or the rewrite lands nowhere. That makes
+              # the patch chain indifferent to how upstream chunks its bundle: a target
+              # moving between chunks is a no-op, and only a genuine shape change fails.
+              #
+              # Two hazards this design accepts deliberately:
+              #   - An anchor may legitimately hit files the substitution should skip (see
+              #     patch 08a, whose anchor also matches the resources/i18n resolver). The
+              #     substitution is the real filter; "applied in 1/2" is a pass.
+              #   - A target duplicated across files must be rewritten in all of them
+              #     (patches 17a/17b/19), which falls out of the loop for free.
               BUILD_DIR="extracted/.vite/build"
-              CHUNK=$(perl -ne 'print "$1\n" if m{require\("\./(index\.chunk-[\w-]+\.js)"\)}' "$BUILD_DIR/index.js" | head -1)
-              if [ -n "$CHUNK" ] && [ -f "$BUILD_DIR/$CHUNK" ]; then
-                INDEX="$BUILD_DIR/$CHUNK"
-                echo "  Main process is code-split; patching $CHUNK"
-              else
-                INDEX="$BUILD_DIR/index.js"
-                echo "  Main process is monolithic; patching index.js"
-              fi
               MAINVIEW="$BUILD_DIR/mainView.js"
+
+              targets_for() {
+                grep -rlP --include='*.js' -- "$1" "$BUILD_DIR" 2>/dev/null | sort
+              }
+
+              # apply_patch <label> <anchor-regex> <perl-expr> <verify-regex>
+              apply_patch() {
+                local label="$1" anchor="$2" expr="$3" verify="$4"
+                local files applied=0 seen=0 f
+                files=$(targets_for "$anchor")
+                if [ -z "$files" ]; then
+                  echo "ERROR: patch $label — anchor matched no build file."
+                  echo "  anchor: $anchor"
+                  exit 1
+                fi
+                for f in $files; do
+                  seen=$((seen + 1))
+                  perl -0777 -i -pe "$expr" "$f"
+                  if grep -qP -- "$verify" "$f"; then applied=$((applied + 1)); fi
+                done
+                if [ "$applied" -eq 0 ]; then
+                  echo "ERROR: patch $label — anchor hit $seen file(s) but the rewrite applied nowhere."
+                  echo "  Upstream changed the target's shape; re-derive the regex."
+                  echo "  files: $(echo "$files" | tr '\n' ' ')"
+                  exit 1
+                fi
+                echo "[patch:$label] applied in $applied/$seen file(s)"
+              }
+
+              # assert_absent_or_die <label> <regex> <message>
+              assert_present() {
+                grep -rqP --include='*.js' -- "$2" "$BUILD_DIR" \
+                  || { echo "ERROR: patch $1 — $3"; exit 1; }
+                echo "[patch:$1] verified"
+              }
+
+              echo "  Build tree: $(find "$BUILD_DIR" -name '*.js' | wc -l) JS files"
 
               # --- Patch 00: Native module stub ---
               echo "[patch:00] Installing native module stub..."
@@ -226,7 +271,13 @@
               cat > extracted/node_modules/claude-cowork-linux/package.json <<COWORKPKG
               {"name":"claude-cowork-linux","version":"2.0.0","main":"index.js"}
               COWORKPKG
-              cat ${./scripts/cowork-init.js} >> "$INDEX"
+              # Append to index.js, the main-process entry that requires every chunk.
+              # Running last in that module means all chunks are loaded before
+              # global.__linuxCowork is set, which is what the availability (03) and VM
+              # getter (06) patches read — they are called lazily, never at module load.
+              cat ${./scripts/cowork-init.js} >> "$BUILD_DIR/index.js"
+              ${pkgs.nodejs}/bin/node --check "$BUILD_DIR/index.js" \
+                || { echo "ERROR: patch 01 — index.js no longer parses after append"; exit 1; }
               echo "[patch:01] Done"
 
               # --- Patch 02: RETIRED in v1.13576.4 ---
@@ -252,42 +303,91 @@
               # pair that fed availability was inlined away in this refactor).
               # Anchor on the structural prefix (unique); function name may contain
               # `$`, so match with [\w\$]+. Local names vary — use \w+.
+              # v1.26832.0 keeps the same function body but the minifier changed twice
+              # over: declarations are emitted as `let` instead of `const`, and every
+              # string literal is a backtick template literal instead of double-quoted.
+              # Both are global to this build, so `(?:const|let)` and `[`"]` appear in
+              # every regex below — writing them as wildcards costs nothing and means a
+              # future minifier flip back does not break the chain again.
               echo "[patch:03] Patching Cowork availability..."
-              perl -i -pe 's{(function )([\w\$]+)(\(\)\{)(const \w+=\w+\(\);if\(\w+\)return \w+;if\(\w+\)return \w+;const \w+=\w+\(\);if\(\w+\.status!=="supported")}{$1$2$3if(process.platform==="linux"\&\&global.__linuxCowork)return\{status:"supported"\};$4}g' "$INDEX"
-              grep -qP 'if\(process\.platform==="linux"&&global\.__linuxCowork\)return\{status:"supported"\}' "$INDEX" \
-                || { echo "ERROR: patch 03 (Cowork availability) failed to apply"; exit 1; }
+              apply_patch 03 \
+                'function [\w\$]+\(\)\{(?:const|let) [\w\$]+=[\w\$]+\(\);if\([\w\$]+\)return [\w\$]+;if\([\w\$]+\)return [\w\$]+;(?:const|let) [\w\$]+=[\w\$]+\(\);if\([\w\$]+\.status!==' \
+                's{(function )([\w\$]+)(\(\)\{)((?:const|let) [\w\$]+=[\w\$]+\(\);if\([\w\$]+\)return [\w\$]+;if\([\w\$]+\)return [\w\$]+;(?:const|let) [\w\$]+=[\w\$]+\(\);if\([\w\$]+\.status!==[`"]supported[`"])}{$1$2$3if(process.platform==="linux"&&global.__linuxCowork)return{status:"supported"};$4}g' \
+                'if\(process\.platform==="linux"&&global\.__linuxCowork\)return\{status:"supported"\}'
               echo "[patch:03] Done"
 
               # --- Patch 04: Skip download (regex) ---
-              # Skips macOS VM bundle download on Linux
-              # Parameter names vary across versions (t,e / e,A / ...) — use \w+.
+              # Skips the macOS VM bundle download on Linux.
+              # The old anchor was "the first `async function X(a,b){` with [downloadVM]
+              # logged within 200 chars", which is no longer specific enough: v1.26832.0
+              # has three such functions in the VM chunk, and the nearest one is `it(e,t)`,
+              # a stale-cache *sweeper*, not the downloader. Neutralizing that would leave
+              # the download running while breaking cache cleanup.
+              # Anchor on the destructure instead. The exported entry point is the only
+              # one shaped `async function X(a,b){let{yukonSilver:c}=…` — it reads the
+              # availability verdict (which patch 03 forces to "supported" on Linux) and
+              # then dispatches the real downloader. Returning !1 there is exactly the
+              # branch upstream takes when the feature is unsupported.
               echo "[patch:04] Patching download skip..."
-              perl -i -pe 's{(async function \w+\(\w+,\w+\)\{)(.{0,200}?\[downloadVM\])}{$1if(process.platform==="linux"\&\&global.__linuxCowork){console.log("[Cowork Linux] Skipping bundle download");return!1}$2}g' "$INDEX"
-              grep -qP 'async function \w+\(\w+,\w+\)\{if\(process\.platform==="linux"' "$INDEX" \
-                || { echo "ERROR: patch 04 (skip download) failed to apply"; exit 1; }
+              apply_patch 04 \
+                'async function [\w\$]+\([\w\$]+,[\w\$]+\)\{(?:const|let)\{yukonSilver:' \
+                's{(async function [\w\$]+\([\w\$]+,[\w\$]+\)\{)((?:const|let)\{yukonSilver:[\w\$]+\}=.{0,220}?\[downloadVM\])}{$1if(process.platform==="linux"&&global.__linuxCowork){console.log("[Cowork Linux] Skipping bundle download");return!1}$2}gs' \
+                'if\(process\.platform==="linux"&&global\.__linuxCowork\)\{console\.log\("\[Cowork Linux\] Skipping bundle download"\)'
               echo "[patch:04] Done"
 
               # --- Patch 05: VM start intercept (dynamic Node.js) ---
               # Discovers function name via [VM:start] log string, injects bubblewrap session
+              # No file argument: the script locates its own target by scanning for the
+              # [VM:start] anchor, the same way apply_patch does.
               echo "[patch:05] Patching VM start intercept..."
-              ${pkgs.nodejs}/bin/node ${./scripts/patch-vm-start.js} extracted "$INDEX"
+              ${pkgs.nodejs}/bin/node ${./scripts/patch-vm-start.js} extracted
               echo "[patch:05] Done"
 
               # --- Patch 06a: VM getter (regex) ---
-              # Returns Linux VM instance from getter function
+              # Returns the Linux VM instance from the module's VM getters.
+              # v1.26832.0 rewrote both getters with optional chaining:
+              #   was: async function X(){const a=await Y();return(a==null?void 0:a.vm)??null}
+              #   now: async function X(){return(await Y())?.vm??null}
+              #        X.getCached=function(){return CACHED?.vm??null}
+              # 06a-1 handles the async getter (as before). 06a-2 is new: the synchronous
+              # `.getCached` sibling did not exist as a separate function before the
+              # refactor, and callers that take the sync path would otherwise see null on
+              # Linux even with a live session — a silent "Cowork not running" rather than
+              # an error. Both must agree.
               echo "[patch:06a] Patching VM getter..."
-              perl -i -pe 's{(async function )(\w+)(\(\)\{)(const \w+=await \w+\(\);return\(\w+==null\?void 0:\w+\.vm\)\?\?null)}{$1$2$3if(process.platform==="linux"\&\&global.__linuxCowork\&\&global.__linuxCowork.vmInstance){console.log("[Cowork Linux] $2() returning Linux VM");return global.__linuxCowork.vmInstance}$4}g' "$INDEX"
-              grep -qP '\[Cowork Linux\] \w+\(\) returning Linux VM' "$INDEX" \
-                || { echo "ERROR: patch 06a (VM getter) failed to apply"; exit 1; }
+              apply_patch 06a-1 \
+                'async function [\w\$]+\(\)\{return\(await [\w\$]+\(\)\)\?\.vm\?\?null\}' \
+                's{(async function )([\w\$]+)(\(\)\{)(return\(await [\w\$]+\(\)\)\?\.vm\?\?null\})}{$1$2$3if(process.platform==="linux"&&global.__linuxCowork&&global.__linuxCowork.vmInstance){console.log("[Cowork Linux] $2() returning Linux VM");return global.__linuxCowork.vmInstance}$4}g' \
+                '\[Cowork Linux\] [\w\$]+\(\) returning Linux VM'
+              apply_patch 06a-2 \
+                '[\w\$]+\.getCached=function\(\)\{return [\w\$]+\?\.vm\?\?null\}' \
+                's{([\w\$]+\.getCached=function\(\)\{)(return [\w\$]+\?\.vm\?\?null\})}{$1if(process.platform==="linux"&&global.__linuxCowork&&global.__linuxCowork.vmInstance)return global.__linuxCowork.vmInstance;$2}g' \
+                'getCached=function\(\)\{if\(process\.platform==="linux"&&global\.__linuxCowork&&global\.__linuxCowork\.vmInstance\)return global\.__linuxCowork\.vmInstance;'
               echo "[patch:06a] Done"
 
-              # --- Patch 06b: Platform getter (regex) ---
-              # Don't return null for Linux in platform-gated getter
-              echo "[patch:06b] Patching platform getter..."
-              perl -i -pe 's{(async function [\w\$]+\(\)\{return )process\.platform!=="darwin"\?null(:await \w+\(\))}{''${1}process.platform!=="darwin"\&\&process.platform!=="linux"?null''${2}}g' "$INDEX"
-              grep -qP 'process\.platform!=="darwin"&&process\.platform!=="linux"\?null' "$INDEX" \
-                || { echo "ERROR: patch 06b (platform getter) failed to apply"; exit 1; }
-              echo "[patch:06b] Done"
+              # --- Patch 06b: RETIRED (v1.26832.0) ---
+              # Was: widen the platform-gated Swift-module getter (`getSwiftAddon()`,
+              # exported as `.K`) so it did not short-circuit to null on Linux.
+              # It cannot do anything useful now, and what it would do is harmful.
+              #
+              # That getter returns the raw @ant/claude-swift module, not our VM instance.
+              # Its three consumers are:
+              #   `let t=await K(); t&&(t.on("guestConnectionChanged",…))`
+              #   `let S=await K(); … S?.on("vmStateChanged",…)`
+              #   `if(await K()===null)return{xcode:!1,simulators:!1}`
+              # — two call `.on()`, one tests `=== null`. So the getter is only allowed to
+              # return null or a real EventEmitter. On Linux the module resolves to `{}`
+              # (see patch 21), which is neither: it is truthy, so it passes the `t&&`
+              # guard and survives `S?.`, then throws on `.on`.
+              # Patch 21 makes the loader return null on non-darwin, so this getter now
+              # yields null on Linux with or without the widening — the rewrite is
+              # provably inert, and the repo's rule is that inert patches get retired
+              # rather than left to rot (see patch 09).
+              # Cowork does not lose anything: the VM instance the app actually drives
+              # comes from the other two getters, which patches 06a-1/06a-2 intercept.
+              # Restore this only if upstream ships a real Linux @ant/claude-swift that
+              # is an EventEmitter — the `{}` stub is not one.
+              echo "[patch:06b] Skipped (retired — getter must yield null or an EventEmitter; see patch 21)"
 
               # --- Patch 07: Platform branding ---
               echo "[patch:07] Injecting platform branding fix..."
@@ -296,10 +396,20 @@
 
               # --- Patch 08a: Tray icon resource path (regex) ---
               # Returns real filesystem path on Linux (COSMIC SNI can't read from ASAR)
+              # Two shape changes since v1.24012.9: the packaged branch reads a bare
+              # `process.resourcesPath` (it used to go through a namespaced electron
+              # import), and `path` is reached as `X.default.resolve` under the new
+              # interop helper — hence [\w\$.]+ for module refs throughout.
+              # The anchor deliberately also matches the resources/i18n resolver in a
+              # different chunk; the substitution requires the argument list to END at
+              # "resources", so i18n is left alone. Redirecting it would be a real bug:
+              # installPhase copies only TrayIcon*/icon.png next to the asar, while the
+              # i18n JSON lives inside it, and the unpatched resolver already finds it.
               echo "[patch:08a] Patching tray icon resource path..."
-              perl -i -pe 's{function ([\w\$]+)\(\)\{return ([\w\$]+)\.app\.isPackaged\?([\w\$]+)\.resourcesPath:([\w\$]+)\.resolve\(__dirname,"\.\.","\.\.","resources"\)\}}{function $1(){return process.platform==="linux"?$4.join($4.dirname($2.app.getAppPath()),"resources"):$2.app.isPackaged?$3.resourcesPath:$4.resolve(__dirname,"..","..","resources")}}g' "$INDEX"
-              grep -qP 'process\.platform==="linux"\?\w+\.join\(\w+\.dirname\(' "$INDEX" \
-                || { echo "ERROR: patch 08a (tray icon path) failed to apply"; exit 1; }
+              apply_patch 08a \
+                'function [\w\$]+\(\)\{return [\w\$]+\.app\.isPackaged\?process\.resourcesPath:[\w\$.]+\.resolve\(__dirname,' \
+                's{function ([\w\$]+)\(\)\{return ([\w\$]+)\.app\.isPackaged\?process\.resourcesPath:([\w\$.]+)\.resolve\(__dirname,([`"])\.\.\4,\4\.\.\4,\4resources\4\)\}}{function $1(){return process.platform==="linux"?$3.join($3.dirname($2.app.getAppPath()),"resources"):$2.app.isPackaged?process.resourcesPath:$3.resolve(__dirname,"..","..","resources")}}g' \
+                'process\.platform==="linux"\?[\w\$.]+\.join\([\w\$.]+\.dirname\('
               echo "[patch:08a] Done"
 
               # --- Patch 08b: Tray icon filename (regex) ---
@@ -317,17 +427,34 @@
               # Route the template case to upstream's own Linux expression on Linux,
               # capturing the desktop-env fn and electron namespace from the "png" case
               # so their minified names stay wildcards. Non-Linux behaviour is unchanged.
+              # The desktop-environment probe is now reached through a namespace
+              # (`p.rt()` rather than a local `de()`), so the captured callee must allow
+              # dots. Quote style is captured (\1) and reused.
               echo "[patch:08b] Patching tray icon filename selection..."
-              perl -i -pe 's{case"template-image":([\w\$]+)="TrayIconTemplate\.png";break;(case"png":\1=([\w\$]+)\(\)==="gnome"\|\|([\w\$]+)\.nativeTheme\.shouldUseDarkColors\?"TrayIconLinux-Dark\.png":"TrayIconLinux\.png";break)}{case"template-image":$1=process.platform==="linux"?($3()==="gnome"||$4.nativeTheme.shouldUseDarkColors?"TrayIconLinux-Dark.png":"TrayIconLinux.png"):"TrayIconTemplate.png";break;$2}g' "$INDEX"
-              grep -qP 'case"template-image":[\w\$]+=process\.platform==="linux"\?\([\w\$]+\(\)==="gnome"\|\|[\w\$]+\.nativeTheme\.shouldUseDarkColors\?"TrayIconLinux-Dark\.png":"TrayIconLinux\.png"\):"TrayIconTemplate\.png"' "$INDEX" \
-                || { echo "ERROR: patch 08b (tray icon filename) failed to apply"; exit 1; }
+              apply_patch 08b \
+                'case[`"]template-image[`"]:[\w\$]+=[`"]TrayIconTemplate\.png[`"];break;' \
+                's{case([`"])template-image\1:([\w\$]+)=\1TrayIconTemplate\.png\1;break;(case\1png\1:\2=([\w\$.]+)\(\)===\1gnome\1\|\|([\w\$.]+)\.nativeTheme\.shouldUseDarkColors\?\1TrayIconLinux-Dark\.png\1:\1TrayIconLinux\.png\1;break)}{case$1template-image$1:$2=process.platform==="linux"?($4()==="gnome"||$5.nativeTheme.shouldUseDarkColors?"TrayIconLinux-Dark.png":"TrayIconLinux.png"):"TrayIconTemplate.png";break;$3}g' \
+                'case[`"]template-image[`"]:[\w\$]+=process\.platform==="linux"\?\([\w\$.]+\(\)==="gnome"\|\|[\w\$.]+\.nativeTheme\.shouldUseDarkColors\?"TrayIconLinux-Dark\.png":"TrayIconLinux\.png"\):"TrayIconTemplate\.png"'
               echo "[patch:08b] Done"
 
-              # --- Patch 09: DBus tray cleanup delay (regex) ---
-              # Prevents StatusNotifierItem registration race on Linux
-              echo "[patch:09] Patching tray DBus cleanup delay..."
-              perl -i -pe 's{(\w+)&&\(\1\.destroy\(\),\1=null\)}{$1&&($1.destroy(),$1=null,setTimeout(()=>{},250))}g' "$INDEX"
-              echo "[patch:09] Done"
+              # --- Patch 09: RETIRED (v1.26832.0) ---
+              # Was: rewrite `X&&(X.destroy(),X=null)` to append `setTimeout(()=>{},250)`,
+              # described as a DBus tray cleanup delay.
+              # Retired for two independent reasons, either of which is sufficient:
+              #   1. The shape is gone. v1.26832.0 guards the teardown with an
+              #      isDestroyed() check and drops the parenthesised group:
+              #        `$&&!$.isDestroyed()&&$.destroy(),$=null,Gf=null,i.w();`
+              #      The old regex matches nothing anywhere in the tree.
+              #   2. The payload never did anything. Scheduling an empty callback does
+              #      not delay the surrounding synchronous statement — it just queues a
+              #      timer nobody awaits. Tray destroy/recreate ordering is unchanged
+              #      with or without it.
+              # This patch had no verification grep, so (1) would have silently no-opped
+              # exactly like the ASAR-header bug in patch 18 did. Every patch below now
+              # goes through apply_patch, which fails the build instead. If an SNI
+              # re-registration race does show up, fix it by deferring the *recreate*,
+              # not by queueing a timer next to the destroy.
+              echo "[patch:09] Skipped (retired — pattern gone upstream, payload was inert)"
 
               # --- Patch 11: shellPathWorker.js asar resolution (regex) ---
               # In wrapped-Electron builds (makeWrapper), process.resourcesPath points to the
@@ -335,9 +462,10 @@
               # (the app.asar path passed by makeWrapper) directly — Electron's fs treats
               # the asar path as a directory containing its archived files transparently.
               echo "[patch:11] Patching shellPathWorker base path..."
-              perl -i -pe 's{function (\w+)\(\)\{return (\w+)\.join\(process\.resourcesPath,"app\.asar",".vite","build","shell-path-worker","shellPathWorker\.js"\)\}}{function $1(){if(process.platform==="linux"\&\&process.argv[1]\&\&process.argv[1].includes("app.asar"))return $2.join(process.argv[1],".vite","build","shell-path-worker","shellPathWorker.js");return $2.join(process.resourcesPath,"app.asar",".vite","build","shell-path-worker","shellPathWorker.js")}}g' "$INDEX"
-              grep -qP 'process\.platform==="linux"&&process\.argv\[1\]&&process\.argv\[1\]\.includes\("app\.asar"\)' "$INDEX" \
-                || { echo "ERROR: patch 11 (shellPathWorker base) failed to apply"; exit 1; }
+              apply_patch 11 \
+                'function [\w\$]+\(\)\{return [\w\$.]+\.join\(process\.resourcesPath,[`"]app\.asar[`"]' \
+                's{function ([\w\$]+)\(\)\{return ([\w\$.]+)\.join\(process\.resourcesPath,([`"])app\.asar\3,\3\.vite\3,\3build\3,\3shell-path-worker\3,\3shellPathWorker\.js\3\)\}}{function $1(){if(process.platform==="linux"&&process.argv[1]&&process.argv[1].includes("app.asar"))return $2.join(process.argv[1],".vite","build","shell-path-worker","shellPathWorker.js");return $2.join(process.resourcesPath,"app.asar",".vite","build","shell-path-worker","shellPathWorker.js")}}g' \
+                'process\.platform==="linux"&&process\.argv\[1\]&&process\.argv\[1\]\.includes\("app\.asar"\)'
               echo "[patch:11] Done"
 
               # --- Patch 12: RETIRED in v1.20186.1 ---
@@ -353,8 +481,12 @@
               # exactly what this patch always left intact. Nothing to neutralize.
               # Assert no forced suffixer returns; if one does, the send button silently
               # breaks again, so fail loudly and restore the pass-through rewrite.
+              # Regex note: the brace after the dollar is written as a character class,
+              # so a dollar-brace pair never appears literally here. Nix reads that pair
+              # as string interpolation even inside a shell comment, so keeping it out of
+              # the file entirely is the only reliable way to avoid escaping ambiguity.
               echo "[patch:12] Verifying no forced [1m] model-suffix function remains..."
-              if grep -qP '\?[\w\$]+:`\$\{[\w\$]+\}\[1m\]`' "$INDEX"; then
+              if grep -rqP --include='*.js' -- '\?[\w\$]+:[`"]\$[{][\w\$]+[}]\[1m\][`"]' "$BUILD_DIR"; then
                 echo "ERROR: patch 12 — a forced [1m] suffix function is back; restore the neutralizing rewrite"
                 exit 1
               fi
@@ -367,8 +499,9 @@
               # inject the branch, assert it is present — if a future version drops it,
               # this verification fails loudly so the injection can be restored.
               echo "[patch:13] Verifying native getHostPlatform Linux branch..."
-              grep -qP 'getHostPlatform\(\)\{const \w+=process\.arch;.{0,160}if\(process\.platform==="linux"\)return \w+==="arm64"\?"linux-arm64":"linux-x64"' "$INDEX" \
-                || { echo "ERROR: patch 13 — native getHostPlatform Linux branch missing; re-derive injection needed"; exit 1; }
+              assert_present 13 \
+                'getHostPlatform\(\)\{(?:const|let) [\w\$]+=process\.arch;.{0,220}if\(process\.platform===([`"])linux\1\)return [\w\$]+===\1arm64\1\?\1linux-arm64\1:\1linux-x64\1' \
+                'native getHostPlatform Linux branch missing; re-derive injection needed'
               echo "[patch:13] Done (native upstream branch, no patch needed)"
 
               # --- Patch 14: CLAUDE_CODE_LOCAL_BINARY constructor wiring (regex) ---
@@ -378,10 +511,13 @@
               # initLocalBinary(env) and store the promise so getLocalBinaryPath()
               # short-circuits CCD entry points before they hit getHostTarget().
               # This is what makes claudeCodePackage / Code-LOCAL functional again.
+              # The only patch whose target text is byte-identical to v1.24012.9 — it
+              # matches no string literals, so the minifier's quote flip did not touch it.
               echo "[patch:14] Restoring CLAUDE_CODE_LOCAL_BINARY constructor wiring..."
-              perl -i -pe 's{process\.env\.CLAUDE_CODE_LOCAL_BINARY\}async initLocalBinary}{process.env.CLAUDE_CODE_LOCAL_BINARY\&\&(this.localBinaryInitPromise=this.initLocalBinary(process.env.CLAUDE_CODE_LOCAL_BINARY))\}async initLocalBinary}g' "$INDEX"
-              grep -qP 'this\.localBinaryInitPromise=this\.initLocalBinary\(process\.env\.CLAUDE_CODE_LOCAL_BINARY\)' "$INDEX" \
-                || { echo "ERROR: patch 14 (CLAUDE_CODE_LOCAL_BINARY wiring) failed to apply"; exit 1; }
+              apply_patch 14 \
+                'process\.env\.CLAUDE_CODE_LOCAL_BINARY\}async initLocalBinary' \
+                's{process\.env\.CLAUDE_CODE_LOCAL_BINARY\}async initLocalBinary}{process.env.CLAUDE_CODE_LOCAL_BINARY&&(this.localBinaryInitPromise=this.initLocalBinary(process.env.CLAUDE_CODE_LOCAL_BINARY))\}async initLocalBinary}g' \
+                'this\.localBinaryInitPromise=this\.initLocalBinary\(process\.env\.CLAUDE_CODE_LOCAL_BINARY\)'
               echo "[patch:14] Done"
 
               # --- Patch 15: RETIRED (v1.13576.4), re-verified for v1.20186.1 ---
@@ -402,10 +538,12 @@
               # assert it, plus the null-guard that keeps an unknown platform from
               # indexing undefined.
               echo "[patch:15] Verifying VM bundle lookup maps Linux to a real key..."
-              grep -qP 'switch\([\w\$]+\)\{case"darwin":case"linux":return"unix";' "$INDEX" \
-                || { echo "ERROR: patch 15 — linux is no longer mapped to a bundle key; re-derive guard"; exit 1; }
-              grep -qP 'if\(![\w\$]+\)return\[\];const [\w\$]+=[\w\$]+\(\);return [\w\$]+\.files\[[\w\$]+\]\[[\w\$]+\]\?\?\[\]' "$INDEX" \
-                || { echo "ERROR: patch 15 — bundle lookup lost its null-platform guard; re-derive guard"; exit 1; }
+              assert_present 15 \
+                'switch\([\w\$]+\)\{case([`"])darwin\1:case\1linux\1:return\1unix\1;' \
+                'linux is no longer mapped to a bundle key; re-derive guard'
+              assert_present 15 \
+                'if\(![\w\$]+\)return\[\];(?:const|let) [\w\$]+=[\w\$]+\(\);return [\w\$.]+\.files\[[\w\$]+\]\[[\w\$]+\]\?\?\[\]' \
+                'bundle lookup lost its null-platform guard; re-derive guard'
               echo "[patch:15] Done (linux maps to files.unix upstream, no patch needed)"
 
               # --- Patch 16: Guard macOS-fork-only Electron startup APIs (regex) ---
@@ -420,13 +558,18 @@
               #        bCo) — macOS TouchID WebAuthn config. Existence-guard it (it is
               #        an API-presence issue, not purely platform) so it no-ops on
               #        stock Electron and self-enables if a build ever ships the API.
+              # 16a and 16b now live in different chunks (index.js and a lazily-required
+              # WebAuthn chunk respectively), which is exactly the scatter apply_patch
+              # exists to absorb — neither needs a hardcoded filename.
               echo "[patch:16] Guarding macOS-fork-only Electron startup APIs..."
-              perl -i -pe 's{((\w+)\.systemPreferences\.setUserDefault\("NSAutoFillHeuristicsEnabled","boolean",!1\))}{process.platform==="darwin"\&\&$1}g' "$INDEX"
-              grep -qP 'process\.platform==="darwin"&&\w+\.systemPreferences\.setUserDefault\("NSAutoFillHeuristicsEnabled"' "$INDEX" \
-                || { echo "ERROR: patch 16a (setUserDefault guard) failed to apply"; exit 1; }
-              perl -i -pe 's{(\w+)\.app\.configureWebAuthn\(}{$1.app.configureWebAuthn\&\&$1.app.configureWebAuthn(}g' "$INDEX"
-              grep -qP '\w+\.app\.configureWebAuthn&&\w+\.app\.configureWebAuthn\(' "$INDEX" \
-                || { echo "ERROR: patch 16b (configureWebAuthn guard) failed to apply"; exit 1; }
+              apply_patch 16a \
+                '[\w\$]+\.systemPreferences\.setUserDefault\([`"]NSAutoFillHeuristicsEnabled[`"]' \
+                's{(([\w\$]+)\.systemPreferences\.setUserDefault\(([`"])NSAutoFillHeuristicsEnabled\3,\3boolean\3,!1\))}{process.platform==="darwin"&&$1}g' \
+                'process\.platform==="darwin"&&[\w\$]+\.systemPreferences\.setUserDefault\([`"]NSAutoFillHeuristicsEnabled'
+              apply_patch 16b \
+                '[\w\$]+\.app\.configureWebAuthn\(' \
+                's{([\w\$]+)\.app\.configureWebAuthn\(}{$1.app.configureWebAuthn&&$1.app.configureWebAuthn(}g' \
+                '[\w\$]+\.app\.configureWebAuthn&&[\w\$]+\.app\.configureWebAuthn\('
               echo "[patch:16] Done"
 
               # --- Patch 17: Guard macOS-only BrowserWindow chrome APIs (regex) ---
@@ -439,13 +582,19 @@
               #   17b `win.setHiddenInMissionControl(!0)` — one call site is not behind
               #        a darwin check (always-on-top pop-up path). Blanket-guarding all
               #        sites is safe; darwin-gated ones just gain a harmless inner check.
+              # Both APIs are called from two chunks each in v1.26832.0 (index.js plus a
+              # sibling), and every site must be guarded — one unguarded call is one
+              # unhandled rejection. apply_patch rewrites all files holding the anchor,
+              # so "applied in 2/2" is the expected line here, not 1/2.
               echo "[patch:17] Guarding macOS-only BrowserWindow chrome APIs..."
-              perl -i -pe 's{(\w+)\.setWindowButtonPosition\(}{$1.setWindowButtonPosition\&\&$1.setWindowButtonPosition(}g' "$INDEX"
-              grep -qP '\w+\.setWindowButtonPosition&&\w+\.setWindowButtonPosition\(' "$INDEX" \
-                || { echo "ERROR: patch 17a (setWindowButtonPosition guard) failed to apply"; exit 1; }
-              perl -i -pe 's{(\w+)\.setHiddenInMissionControl\(}{$1.setHiddenInMissionControl\&\&$1.setHiddenInMissionControl(}g' "$INDEX"
-              grep -qP '\w+\.setHiddenInMissionControl&&\w+\.setHiddenInMissionControl\(' "$INDEX" \
-                || { echo "ERROR: patch 17b (setHiddenInMissionControl guard) failed to apply"; exit 1; }
+              apply_patch 17a \
+                '[\w\$]+\.setWindowButtonPosition\(' \
+                's{([\w\$]+)\.setWindowButtonPosition\(}{$1.setWindowButtonPosition&&$1.setWindowButtonPosition(}g' \
+                '[\w\$]+\.setWindowButtonPosition&&[\w\$]+\.setWindowButtonPosition\('
+              apply_patch 17b \
+                '[\w\$]+\.setHiddenInMissionControl\(' \
+                's{([\w\$]+)\.setHiddenInMissionControl\(}{$1.setHiddenInMissionControl&&$1.setHiddenInMissionControl(}g' \
+                '[\w\$]+\.setHiddenInMissionControl&&[\w\$]+\.setHiddenInMissionControl\('
               echo "[patch:17] Done"
 
               # --- Patch 18a: reserve node-pty's build/Release in the ASAR header ---
@@ -508,33 +657,115 @@
               # `er()`/spawnAsync compares `rewritten.cmd !== originalCmd` to decide whether
               # to tag errors "via disclaimer"; the pass-through keeps them equal, so spawn
               # failures surface with their own message rather than a bogus disclaimer one.
-              # Three copies exist (main chunk + two workers) in two textual shapes —
-              # minified single-line and pretty-printed multi-line — so match in slurp
-              # mode with flexible whitespace and require the same parameter name on both
-              # `.cmd` and `.args` so only the real wrapper matches.
+              # The wrapper is duplicated in two textual shapes — minified single-line in a
+              # chunk, pretty-printed multi-line in a worker bundle — so match in slurp
+              # mode with flexible whitespace, and require the same parameter name on both
+              # `.cmd` and `.args` so only the real wrapper matches. That parameter check
+              # is load-bearing: a Windows PowerShell helper elsewhere in the tree also
+              # returns `{cmd:…,args:[…]}` and must not be rewritten.
+              # The site list was hardcoded to three files; v1.26832.0 has two. The
+              # shellPathWorker copy is gone (that worker no longer spawns through the
+              # helper), and hardcoding meant a missing file was a hard error — a build
+              # break for something upstream is free to do. Discover the sites from the
+              # "Helpers"/"disclaimer" path join, which sits in the same bundle as every
+              # wrapper it feeds.
               echo "[patch:19] Bypassing macOS disclaimer spawn helper..."
-              PATCH19_TARGETS="$INDEX $BUILD_DIR/shell-path-worker/shellPathWorker.js $BUILD_DIR/file-index-worker/fileIndexWorker.js"
-              for f in $PATCH19_TARGETS; do
-                if [ ! -f "$f" ]; then
-                  echo "ERROR: patch 19 — expected disclaimer call site missing: $f"; exit 1
-                fi
-                perl -0777 -i -pe 's{(function\s+([\w\$]+)\s*\(\s*([\w\$]+)\s*\)\s*\{)(\s*(?:const\s+[\w\$]+\s*=\s*[\w\$]+\(\)\s*;)?\s*return\s*\{\s*cmd\s*:\s*[\w\$]+(?:\(\))?\s*,\s*args\s*:\s*\[\s*\3\.cmd\s*,\s*\.\.\.\s*\3\.args\s*,?\s*\]\s*,?\s*\}\s*;?\s*\})}{$1if(process.platform!=="darwin")return\{cmd:$3.cmd,args:$3.args\};$4}gs' "$f"
-                grep -qP 'if\(process\.platform!=="darwin"\)return\{cmd:[\w\$]+\.cmd,args:[\w\$]+\.args\}' "$f" \
-                  || { echo "ERROR: patch 19 (disclaimer bypass) failed to apply in $f"; exit 1; }
+              apply_patch 19 \
+                '[`"]Helpers[`"]\s*,\s*[`"]disclaimer[`"]' \
+                's{(function\s+([\w\$]+)\s*\(\s*([\w\$]+)\s*\)\s*\{)(\s*(?:(?:const|let|var)\s+[\w\$]+\s*=\s*[\w\$]+\(\)\s*;)?\s*return\s*\{\s*cmd\s*:\s*[\w\$]+(?:\(\))?\s*,\s*args\s*:\s*\[\s*\3\.cmd\s*,\s*\.\.\.\s*\3\.args\s*,?\s*\]\s*,?\s*\}\s*;?\s*\})}{$1if(process.platform!=="darwin")return\{cmd:$3.cmd,args:$3.args\};$4}gs' \
+                'if\(process\.platform!=="darwin"\)return\{cmd:[\w\$]+\.cmd,args:[\w\$]+\.args\}'
+              echo "[patch:19] Done"
+
+              # --- Patch 20: Swift notification backend must not engage on Linux (regex) ---
+              # New in v1.26832.0. NotificationService.initialize() picks its backend by
+              # truthiness of the Swift addon:
+              #   let m=await loadSwift();
+              #   m ? (this.useSwiftNotifications=!0, this.setupSwiftNotificationHandlers(m), …)
+              #     : log("initialized with Electron notifications")
+              # and the handler setup ends in `m.on("notificationInteraction", …)`.
+              # The catch is in @ant/claude-swift's own non-darwin fallback:
+              #   if (process.platform === "darwin") module.exports = new SwiftAddon();
+              #   else                               module.exports = {};
+              # `{}` is truthy, so on Linux the import *succeeds*, the Swift branch is
+              # taken, and `.on` is undefined — an unhandled rejection during startup:
+              #   TypeError: e.on is not a function
+              #       at Object.setupSwiftNotificationHandlers
+              # plus a Sentry event, on every launch. The window still opens (this is the
+              # "clean launch is not a working app" case), but the service is left with
+              # useSwiftNotifications=true and no working backend, so desktop
+              # notifications never reach the Electron path that does work on Linux.
+              # Fix at the loader, not the call site: returning null is precisely what the
+              # existing catch block does when the module is unavailable, and it is what
+              # makes initialize() log "initialized with Electron notifications" and wire
+              # up the backend that Linux actually has.
+              # `@` is escaped because perl interpolates arrays into s/// patterns.
+              # Other @ant/claude-swift consumers were checked and need no equivalent
+              # guard: the updater and quick-access loaders are already darwin-gated, the
+              # permission fixer tests `!m?.permissionFixer` and throws cleanly, watch-record
+              # is behind a darwin-only availability gate, and the VM loader's consumers
+              # are already intercepted by patches 06a/06b.
+              echo "[patch:20] Disabling Swift notification backend on Linux..."
+              apply_patch 20 \
+                'async function [\w\$]+\(\)\{try\{return [\w\$]+=\(await import\([`"]@ant/claude-swift[`"]\)\)\.default,' \
+                's{(async function [\w\$]+\(\)\{)(try\{return [\w\$]+=\(await import\([`"]\@ant/claude-swift[`"]\)\)\.default,)}{$1if(process.platform!=="darwin")return null;$2}g' \
+                'if\(process\.platform!=="darwin"\)return null;try\{return [\w\$]+=\(await import\('
+              echo "[patch:20] Done"
+
+              # --- Patch 21: Swift VM module loader must not engage on Linux (regex) ---
+              # Same root cause as patch 20, different subsystem. The VM module loader is:
+              #   async function loadVM(){return CACHED||PENDING||(log("[VM] Loading %s module…"),
+              #     PENDING=(async()=>{try{{let m=(await import("@ant/claude-swift")).default;
+              #                             m.vm=wrapProxy(m.vm),CACHED=m}
+              #                          return log("[VM] Module loaded successfully"),CACHED}
+              #                        catch(e){return logError("[VM] Failed to load module: %o",e),
+              #                                        captureException(e),null}})(),PENDING)}
+              # On Linux the import succeeds with `{}`, so `m.vm` is undefined and the
+              # wrapper does `new Proxy(undefined,…)`:
+              #   [VM] Failed to load module: TypeError: Cannot create proxy with a
+              #   non-object as target or handler
+              # It is caught and null is returned — the right value — but only after
+              # throwing and firing captureException, so every Linux launch ships a Sentry
+              # event for a condition that is simply "not macOS".
+              # Note the bare `{…}` block wrapping the import inside the try: another
+              # dead-code-eliminated `if(process.platform==="darwin")`, the same fossil
+              # patch 19 found in getDisclaimerBinaryPath. Upstream guarded this and the
+              # macOS build optimized the guard away; restoring it returns the identical
+              # value by the intended path instead of via an exception.
+              # Cowork is unaffected: its VM instance comes from global.__linuxCowork via
+              # patches 05 and 06a, never from this module.
+              echo "[patch:21] Disabling Swift VM module loader on Linux..."
+              apply_patch 21 \
+                'async function [\w\$]+\(\)\{return [\w\$]+\|\|[\w\$]+\|\|\([\w\$.]+\.info\([`"]\[VM\] Loading' \
+                's{(async function [\w\$]+\(\)\{)(return [\w\$]+\|\|[\w\$]+\|\|\([\w\$.]+\.info\([`"]\[VM\] Loading)}{$1if(process.platform!=="darwin")return null;$2}g' \
+                'if\(process\.platform!=="darwin"\)return null;return [\w\$]+\|\|'
+              echo "[patch:21] Done"
+
+              # --- Post-patch syntax sweep ---
+              # Every rewrite above is a regex against minified JavaScript, where a
+              # mis-balanced brace produces a file that still greps clean and only fails
+              # when Electron requires it — i.e. at runtime, in a subsystem that may well
+              # catch, log and degrade rather than crash. Patch 19 already parsed its own
+              # targets; do it for the whole tree, since apply_patch can now write to any
+              # file. 357 files, a few seconds, and it converts a class of silent runtime
+              # breakage into a build failure.
+              echo "[5/6] Verifying all build files still parse..."
+              PARSE_FAILS=0
+              for f in $(find "$BUILD_DIR" -name '*.js'); do
+                ${pkgs.nodejs}/bin/node --check "$f" 2>/dev/null || {
+                  echo "  PARSE FAILURE: $f"; PARSE_FAILS=$((PARSE_FAILS + 1));
+                }
               done
-              # A malformed rewrite would only surface at runtime, so parse each target.
-              for f in $PATCH19_TARGETS; do
-                ${pkgs.nodejs}/bin/node --check "$f" \
-                  || { echo "ERROR: patch 19 — $f no longer parses after rewrite"; exit 1; }
-              done
-              echo "[patch:19] Done (3 call sites)"
+              if [ "$PARSE_FAILS" -ne 0 ]; then
+                echo "ERROR: $PARSE_FAILS build file(s) no longer parse after patching"; exit 1
+              fi
+              echo "  All build files parse"
 
               # Repack ASAR. node-pty's addon is recorded as an unpacked entry rather
               # than stored inline — native modules must live on the real filesystem,
               # and the header entry is what makes Electron look for it in
               # app.asar.unpacked (patch 18a/18b). asar-tool hard-fails if the path is
               # missing, so a node-pty layout change can't silently drop the entry.
-              echo "[5/6] Repacking ASAR..."
+              echo "[6/6] Repacking ASAR..."
               ${asarTool}/bin/asar-tool pack extracted app.asar \
                 --unpacked node_modules/node-pty/build/Release/pty.node
 
