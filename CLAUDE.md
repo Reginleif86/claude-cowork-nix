@@ -4,32 +4,40 @@ Enabling macOS-only Claude Desktop features on Linux via runtime patching.
 
 ## Architecture
 
-- **Source**: macOS DMG fetched via `fetchurl` (currently v1.26832.0 — tracked by github-actions auto-update)
+- **Source**: macOS DMG fetched via `fetchurl` (currently v1.32352.0 — tracked by github-actions auto-update)
 - **Extraction**: `7zz` (native LZFSE support) + `asar_tool.py`
 - **Runtime**: `electron_41` from nixpkgs
 - **Packaging**: Nix flake with `makeWrapper` + `buildFHSEnv`
 
 ### Where the patches land
 
-There is no longer a single "main chunk". v1.26832.0 shattered the main process:
+**Never key a patch to a filename or a chunk count — upstream reshuffles both, in both
+directions.** Three consecutive releases, three different shapes:
+
+| Version | `index.js` | JS files | Where targets live |
+|---|---|---|---|
+| ≤ v1.24012.9 | ~800 B stub, 1 require | ~95 | all in the one entry chunk |
+| v1.26832.0 | 242 KB, 159 requires | ~350 | scattered over 7+ files |
+| v1.32352.0 | 625 B stub, 2 requires | 140 | nearly all in one 6 MB chunk |
+
+The old rule ("resolve the first require from index.js, patch that file") happened to
+work for the first shape, broke completely on the second, and would work again on the
+third. Do not restore it.
 
 ```
-package.json main -> .vite/build/index.pre.js   (Sentry bootstrap + launch-failure dialog, 4.6 MB)
-  -> require("./index.js")                      (242 KB, requires 159 chunks, holds several targets)
-    -> index{,2}.chunk-<hash>.js                (~350 files, ~14 MB total)
+package.json main -> .vite/build/index.pre.js   (Sentry bootstrap + launch-failure dialog)
+  -> require("./index.js")                      (a stub again in v1.32352.0)
+    -> index{,2}.chunk-<hash>.js                (count and grouping change every release)
 ```
-
-Through v1.24012.9 `index.js` was an ~800-byte stub with one `require()`, and that one
-chunk held every patch target — so the build resolved `$INDEX` from the first require.
-**That heuristic is dead.** The first require now points at an unrelated 1.7 KB chunk,
-and the targets are spread over at least seven files. If you reintroduce single-file
-resolution, every regex patch fails at once.
 
 Patches are therefore keyed on **anchors, not filenames**. `apply_patch <label> <anchor>
 <perl-expr> <verify>` in `flake.nix` greps the whole build tree for the anchor, rewrites
 every file containing it, and fails the build if the anchor is missing *or* the rewrite
 lands nowhere. Upstream re-chunking is then a no-op for us; only a genuine shape change
-fails. Two consequences to read correctly in the build log:
+fails. v1.32352.0 is the proof this was worth doing: the entire bundle was re-chunked
+(350 files down to 140, nearly everything consolidated into one) and **13 of 16 patches
+kept applying with no edit at all**. Only the three whose target *code* genuinely changed
+needed work. Two consequences to read correctly in the build log:
 
 - **`applied in 1/2` is a pass.** An anchor may legitimately match files the
   substitution must skip — patch 08a's anchor also matches the `resources/i18n`
@@ -51,11 +59,11 @@ applies is this exact class of change, not rot.
 cover both shapes, match in `perl -0777` slurp mode with whitespace-flexible regexes
 (see patch 19) rather than writing two patches. Site counts drift — patch 19 covered
 three files through v1.24012.9 and two in v1.26832.0 (the `shellPathWorker` copy is
-gone), which is why the file list is discovered rather than hardcoded.
+gone), which is why the file list is discovered rather than hardcoded. In v1.32352.0 the worker copy is minified too, but keep the whitespace-flexible form — the shapes have alternated before.
 
 **After patching, every build file is `node --check`ed.** A regex that mis-balances a
 brace still greps clean and only fails when Electron requires it — at runtime, possibly
-inside a subsystem that catches and degrades. 357 files, a few seconds.
+inside a subsystem that catches and degrades. A few seconds for the whole tree.
 
 **`{}` is truthy — the defining Linux bug class of this release.**
 `@ant/claude-swift` ends with:
@@ -122,6 +130,16 @@ report up front:
 
 That is how v1.26832.0's two independent breakages (multi-chunk scatter, backtick
 minification) were separated from each other in one pass instead of eighteen builds.
+
+**A lazy window is not a scope.** Any regex of the form `<head> .{0,N}? <unique-anchor>`
+can begin at one function and run forward into a *later* function's anchor, silently
+selecting the wrong target with a completely green build. Patch 05 shipped that shape for
+several releases and was saved only by an incidental arity filter; when v1.32352.0 changed
+the arity, it selected `deleteVMBundle` instead of the VM start function. When the anchor
+is a unique string, find the anchor first and walk **backwards** to the enclosing
+construct — `lastIndexOf` guarantees nothing of that kind lies in between, which no
+forward lazy match can promise. Reserve the forward form for cases where head and anchor
+are genuinely adjacent.
 A small `ctx.js`-style helper that prints regex matches with surrounding context, tagged
 by file, is worth writing first — the bundle is far too large to read.
 
@@ -137,16 +155,16 @@ See `docs/patching-architecture.md` for the full technical analysis.
 
 | # | Method | Purpose |
 |---|--------|---------|
-| 00 | File copy | Electron API stubs for Linux (`@ant/claude-native`). **Also implements the safe-fs containment API** (`openRootDir`, `openBeneath`, `mkdirBeneath`, `renameBeneath`, `unlinkBeneath`) that v1.20186.1 requires — the app refuses to fall back to path-based opens without it ("required for safe-fs containment", CC-2885) and throws `UnsafeRootError` at startup. Native uses `openat2(RESOLVE_BENEATH)`; the stub emulates the guarantee by rejecting `..`/separator/NUL segments and requiring the deepest existing ancestor to `realpath` beneath the root (symlink escape ⇒ `ELOOP`, which callers already treat as unsafe). `openBeneath` returns a **raw fd** (callers `fs.fstat`/`fs.close` it), and `mkdirBeneath` is **non-recursive** and must throw `EEXIST` — the app emulates recursion by walking each path prefix. **v1.26832.0 adds the DeviceRegistry hardware key** (`hardwareKeyGetOrCreate`, `hardwareKeySign`) — see below. |
+| 00 | File copy | Electron API stubs for Linux (`@ant/claude-native`). **Also implements the safe-fs containment API** (`openRootDir`, `openBeneath`, `mkdirBeneath`, `renameBeneath`, `unlinkBeneath`) that v1.20186.1 requires — the app refuses to fall back to path-based opens without it ("required for safe-fs containment", CC-2885) and throws `UnsafeRootError` at startup. Native uses `openat2(RESOLVE_BENEATH)`; the stub emulates the guarantee by rejecting `..`/separator/NUL segments and requiring the deepest existing ancestor to `realpath` beneath the root (symlink escape ⇒ `ELOOP`, which callers already treat as unsafe). `openBeneath` returns a **raw fd** (callers `fs.fstat`/`fs.close` it), and `mkdirBeneath` is **non-recursive** and must throw `EEXIST` — the app emulates recursion by walking each path prefix. **v1.26832.0 adds the DeviceRegistry hardware key** (`hardwareKeyGetOrCreate`, `hardwareKeySign`); **v1.32352.0 adds `readProcessFootprints`** — see below. |
 | 01 | Append IIFE | Load Cowork module |
 | 02 | _retired (v1.13576.4)_ | Was: route Linux through TS VM path via the `_o=…==="win32"` boolean. That boolean pair was inlined away; VM selection is gone (always `@ant/claude-swift`, substituted by patch 06) and availability moved to patch 03. No flag remains to flip. |
-| 03 | `perl -pe` regex | Return "supported" for Linux availability — injects into the unified availability fn (codename "yukonSilver", e.g. `Hce`). Subsumes old patch 02's availability role. |
+| 03 | `perl -pe` regex | Return "supported" for Linux availability — injects a Linux early-return as the first statement of the unified availability fn (codename "yukonSilver"). Subsumes old patch 02's availability role. **Anchored on the `CLAUDE_E2E_ASSUME_VM_SUPPORTED` string literal, not on the function's shape.** v1.32352.0 restructured the body (the two consecutive early-return `if`s became one `if` plus a cached-value `return c||(…)`), which killed a purely structural anchor. That env-var literal is unique to this function and has outlived two refactors. |
 | 04 | `perl -pe` regex | Skip macOS VM bundle download |
-| 05 | Node.js dynamic | Create Linux session at VM start (spawn, writeStdin, mounts, path translation). Takes no file argument — `patch-vm-start.js` finds its own target by scanning for the `[VM:start]` anchor. Its signature regex must keep the declaration keyword a wildcard (`var` through v1.24012.9, `let` in v1.26832.0) and allow a **dotted** status-dispatch enum (`Y(s.d.Ready)`, was a bare local). |
+| 05 | Node.js dynamic | Create Linux session at VM start (spawn, writeStdin, mounts, path translation). Takes no file argument — `patch-vm-start.js` finds its own target by scanning for the `[VM:start]` anchor. **Discovery walks *backwards* from the log call to the nearest preceding `async function`, and must stay that way.** The obvious forward regex (`async function X(params){decl [\s\S]{0,4000}?[VM:start]`) is actively dangerous: the lazy window lets a match *start* at one function and *run into* a later function's log line. In v1.32352.0 `deleteVMBundle` sits 3957 chars before the log call — inside a 4000-char window — so the forward form silently selected it, and Cowork session creation would have been injected into the bundle-**deletion** routine with a green build. Earlier releases escaped only by accident: the signature hardcoded four parameters and `deleteVMBundle` takes none. v1.32352.0 dropped the VM start fn to three params, removing that accidental filter. `lastIndexOf` guarantees no other `async function` lies between head and log line — the property the forward regex cannot provide. Parameter list is captured as raw text (arity is not stable); declaration keyword and a **dotted** status-dispatch enum (`Y(s.d.Ready)`) stay wildcards. |
 | 06a | `perl -pe` regex | Return the Linux VM instance from the VM getters. **Two sites**: the async getter (`async function X(){return(await load())?.vm??null}`) and its synchronous sibling `X.getCached=function(){return CACHED?.vm??null}`. Both must agree — `getCached` is on a live path (`[VM:start]` reads it), and patching only the async one leaves callers seeing null with a running session, i.e. a silent "Cowork not running" rather than an error. v1.26832.0 rewrote both with optional chaining, so the old `(a==null?void 0:a.vm)` shape is gone. |
 | 06b | _retired (v1.26832.0)_ | Was: widen the platform-gated `@ant/claude-swift` getter (exported `.K`) past its darwin check. That getter returns the **raw Swift module**, not our VM instance, and its three consumers either test `=== null` or call `.on(…)` on it — so it may only ever yield null or a real EventEmitter. On Linux the module is `{}`: truthy, no `.on`. Patch 21 makes the loader return null on non-darwin, so the widening is provably inert. Cowork loses nothing — the instance the app actually drives comes through 06a. Restore only if upstream ships a real Linux Swift addon. |
 | 07 | Append IIFE | Replace "for Windows"/"for Mac" with "for Linux" in **app chrome only**. Cosmetic, and deliberately narrow: the original observed `document.body` with `characterData:true`, so it also rewrote text the user typed and text the model streamed — typing "for Windows" in the composer mutated it mid-keystroke, and streamed responses were silently altered (issue #40). `scripts/branding-fix.js` now observes `childList` only (streamed/typed text arrives as `characterData`, so it is structurally unreachable), prunes content subtrees (`[contenteditable]`, `textarea`, `code`/`pre`, `[role=log/textbox]`, message/composer/conversation testids, `.font-claude-response`), and ignores text over 120 chars since platform labels are button-length. Trade-off: a chrome label re-textured in place after first render is no longer caught. **Covered by `tests/branding-fix.test.js`** (`node tests/branding-fix.test.js`) — if you widen the observer, that test is what catches the regression. |
-| 08 | `perl -pe` regex | Tray icon. 08a resolves the resource path to the real filesystem (COSMIC's SNI can't read from an ASAR). 08b picks the filename: v1.20186.1 added a `case"png"` branch with real `TrayIconLinux{,-Dark}.png` assets + a GNOME check, but the icon-type const is baked to `"template-image"` in the macOS build, so 08b routes the template case to upstream's own Linux expression. **08a/08b are coupled to the installPhase icon copy** — it globs `TrayIcon*.png` (not just `TrayIconTemplate*`), since a tray image that is merely missing renders blank with no error. Asserted at build time. |
+| 08 | `perl -pe` regex | Tray icon. 08a resolves the resource path to the real filesystem (COSMIC's SNI can't read from an ASAR). 08b picks the filename: v1.20186.1 added a `case"png"` branch with real `TrayIconLinux{,-Dark}.png` assets + a GNOME check, but the icon-type const is baked to `"template-image"` in the macOS build, so 08b routes the template case to upstream's own Linux expression. v1.32352.0 changed the switch from assign-then-`break` to **direct `return`s**, and gave the `png` case an extra leading term (a force-dark flag the caller passes when retrying after a tray crash). The rewrite therefore captures that whole condition as one opaque group (`[^;]+?` — it contains no semicolon) and reuses it, so upstream can keep changing what feeds the dark/light choice without breaking us. **08a/08b are coupled to the installPhase icon copy** — it globs `TrayIcon*.png` (not just `TrayIconTemplate*`), since a tray image that is merely missing renders blank with no error. Asserted at build time. |
 | 09 | _retired (v1.26832.0)_ | Was: append `setTimeout(()=>{},250)` to `X&&(X.destroy(),X=null)` as a "DBus tray cleanup delay". Retired for two independent reasons: the shape is gone (teardown is now `$&&!$.isDestroyed()&&$.destroy(),$=null,…`, which the old regex never matches), **and the payload was inert anyway** — queueing an empty timer does not delay the surrounding synchronous statement. It had no verification grep, so it would have silently no-opped exactly like the patch-18 ASAR-header bug. If an SNI re-registration race ever appears, defer the *recreate*, not the destroy. |
 | 11 | `perl -pe` regex | Resolve `shellPathWorker.js` from Claude's asar (not Electron runtime's) |
 | 12 | _retired (v1.20186.1)_ | Was: neutralize the two chained `[1m]` model-suffixers whose suffixed id 404s `model_configs` and disabled the Code/LOCAL send button. Upstream no longer force-appends the suffix; `[1m]` survives only in the model *catalog* builders, which expand a 1M-capable model into two selectable entries (`[id, id[1m]]`, `supports_1m_context:!0`) — opt-in, and what the patch always left intact. Patch now asserts no forced suffixer returns. |
@@ -156,15 +174,53 @@ See `docs/patching-architecture.md` for the full technical analysis.
 | 16 | `perl -pe` regex | Guard macOS-fork-only Electron **startup** APIs absent in stock `electron_41` — `systemPreferences.setUserDefault(…)` (darwin-guard) and `app.configureWebAuthn(…)` (existence-guard). Without these the app throws `… is not a function` at module load, before any window opens. |
 | 17 | `perl -pe` regex | Guard macOS-only BrowserWindow chrome APIs (`setWindowButtonPosition`, `setHiddenInMissionControl`) via existence checks — these fire during window setup (async), surfacing as unhandled rejections + Sentry spam rather than blocking launch. |
 | 18 | staged file + `--unpacked` header entry + installPhase overlay | Linux-native `node-pty`. The DMG ships only macOS Mach-O addons, so the in-app terminal/shell PTY fails to load (`Cannot find module .../pty.node`). node-pty 1.2.x moved to a **prebuildify layout** (`prebuilds/darwin-{x64,arm64}/`), so there is no `build/Release` to overlay. 18a stages the `nodePtyElectron` binary at `extracted/node_modules/node-pty/build/Release/pty.node` and the repack passes `--unpacked node_modules/node-pty/build/Release/pty.node`; 18b drops the same binary into the matching `app.asar.unpacked` path, asserts it is an ELF, **and asserts the packed ASAR header records it as `unpacked` with a matching size**. ⚠️ **An empty `build/Release` directory in the header is not enough** — that was the earlier approach and it silently never worked. Electron redirects a read into `app.asar.unpacked` only when the header holds the *file* entry with `"unpacked": true`; with just `"Release":{}` the require falls through every candidate and throws `Cannot find module './prebuilds/linux-x64/pty.node'` at runtime, with no build-time symptom. `tools/asar_tool.py pack` gained `--unpacked <relpath>` for this (it hard-fails if the path is absent, so a layout change can't drop the entry silently). Verify with `tests/pty-roundtrip`. `build/Release` is **first** in node-pty's search order (`lib/utils.js:loadNativeModule`) and arch-agnostic, so it wins over the darwin prebuilds with no linux-x64/arm64 split. `spawn-helper` is macOS-only (`pty.cc` execs it under `__APPLE__`), left untouched. **`nodePtyElectron.version` must track the node-pty the DMG bundles** — N-API keeps the ABI stable but not node-pty's own JS↔native API, so a mismatched `pty.node` loads fine and then throws on a method the JS expects. This drifted silently in the v1.24012.9 bump (DMG moved to `1.2.0-beta.14`, flake still built `beta.13`), so 18a now **asserts** the extracted `node_modules/node-pty/package.json` version equals the top-level `nodePtyVersion`. On a bump, read the version out of the new DMG and update `nodePtyVersion` + the tarball hash together. |
-| 19 | `perl -0777` regex | Bypass the macOS **"disclaimer" spawn helper**. v1.24012.9 routes *every* `spawnAsync` through `<Contents>/Helpers/disclaimer` (macOS calls `responsibility_spawnattrs_setdisclaim` so children aren't attributed to Claude for TCC). The wrapper has **no platform guard** — `getDisclaimerBinaryPath` still carries the vestigial bare `{...}` block where a dead-code-eliminated `if(process.platform==="darwin")` used to be. The helper ships only inside the `.app`, so on Linux every spawn ENOENTs. Visible damage: login-shell env extraction retries 5× then falls back to bare `process.env`, so the user's PATH and exported vars (direnv, nvm, `.zshrc`) never reach Claude Code, MCP servers, or the terminal — a silent degradation, not a crash. Patch makes the wrapper a pass-through on non-darwin. Verify by grepping a launch log for `[CCD] Resolved N login-shell env vars` (good) vs `Shell environment extraction failed` (broken). **Two call sites in two textual shapes** as of v1.26832.0 — minified in a chunk, pretty-printed in `fileIndexWorker.js` (the `shellPathWorker` copy is gone; it was three sites through v1.24012.9) — hence slurp mode. The site list is now *discovered* from the `Helpers`/`disclaimer` path join rather than hardcoded, so upstream dropping a copy is not a build break. The parameter-name backreference on both `.cmd` and `.args` is load-bearing: a Windows PowerShell helper elsewhere in the tree also returns `{cmd:…,args:[…]}` and must not be rewritten. |
+| 19 | `perl -0777` regex | Bypass the macOS **"disclaimer" spawn helper**. v1.24012.9 routes *every* `spawnAsync` through `<Contents>/Helpers/disclaimer` (macOS calls `responsibility_spawnattrs_setdisclaim` so children aren't attributed to Claude for TCC). The wrapper has **no platform guard** — `getDisclaimerBinaryPath` still carries the vestigial bare `{...}` block where a dead-code-eliminated `if(process.platform==="darwin")` used to be. The helper ships only inside the `.app`, so on Linux every spawn ENOENTs. Visible damage: login-shell env extraction retries 5× then falls back to bare `process.env`, so the user's PATH and exported vars (direnv, nvm, `.zshrc`) never reach Claude Code, MCP servers, or the terminal — a silent degradation, not a crash. Patch makes the wrapper a pass-through on non-darwin. Verify by grepping a launch log for `[CCD] Resolved N login-shell env vars` (good) vs `Shell environment extraction failed` (broken). **Two call sites in two textual shapes** as of v1.26832.0 — minified in a chunk, pretty-printed in `fileIndexWorker.js` (the `shellPathWorker` copy is gone; it was three sites through v1.24012.9) — hence slurp mode. The site list is now *discovered* from the `Helpers`/`disclaimer` path join rather than hardcoded, so upstream dropping a copy is not a build break. The parameter-name backreference is load-bearing: a Windows PowerShell helper elsewhere in the tree also returns `{cmd:…,args:[…]}` and must not be rewritten. **v1.32352.0 added process groups to the wrapper**, so it now returns a third key and an args array with a spread prefix: `{cmd:helper, args:[...g?["--pgroup"]:[], o.cmd, ...o.args], processGroupLeader:g}`. The old shape-matching regex no longer fits; match instead on the vestigial `o.cmd,o.args;` expression statement — a dead no-op the minifier left behind, unique to this function, and it still carries the parameter backreference. **`processGroupLeader` must be `!1` on Linux.** It selects the transport class: the process-group one arms a reaper calling `process.kill(-pid)`, which only works if the child really is a group leader — and on macOS it is one only because the helper was invoked with `--pgroup`. With the helper bypassed nothing creates the group, so claiming `true` would give a reaper whose kills silently fail. Consequence, and it is upstream's to give us: MCP server subtrees are not group-reaped on Linux. That capability arrived with this release and has never worked here, because it lives inside a macOS-only binary. |
 | 20 | `perl -0777` regex | **Notifications: don't engage the Swift backend on Linux.** `NotificationService.initialize()` picks its backend by truthiness of the Swift addon, and `setupSwiftNotificationHandlers` ends in `m.on("notificationInteraction", …)`. Because the module resolves to `{}` on Linux, the Swift branch is taken and throws `TypeError: e.on is not a function` — an unhandled rejection plus a Sentry event on every launch, while leaving `useSwiftNotifications=true` and no working backend, so desktop notifications never reach the Electron path that *does* work. Patch returns null from the loader, which is what its own catch block does when the module is unavailable. Verify with `NotificationService initialized with Electron notifications` in a launch log (the Swift wording means it regressed). |
 | 21 | `perl -0777` regex | **VM module loader: same fix, different subsystem.** The loader does `m.vm=wrapProxy(m.vm)`; with `m={}` that is `new Proxy(undefined,…)` → `[VM] Failed to load module: TypeError: Cannot create proxy with a non-object as target or handler`. Caught and null-returned (the right value) but only via a throw + `captureException`, so every Linux launch shipped a Sentry event for "not macOS". Note the bare `{…}` block wrapping the import inside the `try` — another dead-code-eliminated `if(process.platform==="darwin")`, the same fossil patch 19 found. Cowork is unaffected: its VM instance comes from `global.__linuxCowork` via patches 05/06a, never from this module. |
 
 > **Custom Electron fork:** Anthropic's macOS build runs a patched Electron with extra native `app`/`systemPreferences`/`BrowserWindow` methods. Stock nixpkgs `electron_41` lacks them, so each top-level call to one throws on Linux. Patches 16–17 guard the ones hit on the launch path; if a future version adds more, the symptom is `TypeError: X.<method> is not a function` at startup — add an existence/darwin guard following the same pattern.
 
-> **`@ant/claude-native` keeps growing:** the same symptom (`TypeError: X.<method> is not a function`) also appears when the app starts calling a *new* method on the native module we stub. v1.20186.1 added the safe-fs containment API this way; v1.26832.0 added the DeviceRegistry hardware key. When it happens, find the call site in the chunk, derive the contract from how the return value is consumed (e.g. `fs.close(x)` ⇒ raw fd, not a FileHandle), and implement it in `modules/enhanced-claude-native-stub.js` — don't just return a no-op, since the app may guard against exactly that.
+> **`@ant/claude-native` keeps growing:** the same symptom (`TypeError: X.<method> is not a function`) also appears when the app starts calling a *new* method on the native module we stub. v1.20186.1 added the safe-fs containment API this way; v1.26832.0 added the DeviceRegistry hardware key; v1.32352.0 added `readProcessFootprints`. When it happens, find the call site in the chunk, derive the contract from how the return value is consumed (e.g. `fs.close(x)` ⇒ raw fd, not a FileHandle), and implement it in `modules/enhanced-claude-native-stub.js` — don't just return a no-op, since the app may guard against exactly that.
 >
-> **This class of bug is invisible to every automated check we have.** It lives behind IPC from the renderer, so it needs a signed-in session doing real work — `nix build` is green, the launch is clean, and the exit code is 124. The DeviceRegistry break was found only by using the app and then reading the log.
+> **This class of bug is invisible to every automated check we have,** and the two instances found so far needed *different* kinds of session to surface. The DeviceRegistry break lives behind renderer IPC and needed a **signed-in** session doing real work. `readProcessFootprints` is on a **once-a-minute timer**, so a 60-second headless run misses it entirely — it took a 15-minute session to accumulate 15 identical `TypeError`s. Neither produced a Sentry event or an `[error]` line. Budget one long, signed-in, interactive launch per bump, then read the whole log.
+
+### Process footprints (v1.32352.0)
+
+`readProcessFootprints(pids)` feeds the `[process-memory]` sampler, which runs on an
+interval. Its guard is `if (!nativeModule) return nulls` — a bare truthiness test our
+stub passes — so a missing method throws every tick, is caught, and degrades to
+`children=unavailable`.
+
+Contract, derived from the consumer:
+
+- returns a **real Promise** (the caller does `.finally()` on it immediately)
+- resolves to an **array parallel to `pids`**; each element is `null` or `{ footprintBytes, commitBytes }`
+- must **never** resolve to the string `"timeout"` — that is the caller's 5s race sentinel
+
+macOS reports `phys_footprint`; the honest Linux analogue is RSS. Read it from
+`/proc/<pid>/status` (`VmRSS`, in kB) rather than `/proc/<pid>/statm`, which counts
+**pages** and would need the page size — not 4096 everywhere this flake builds, since
+aarch64 kernels commonly use 16K or 64K. `commitBytes` stays `null`: Linux has no clean
+equivalent of the macOS/Windows commit charge, the consumer explicitly tolerates null,
+and inventing a mapping would put wrong numbers into telemetry.
+Covered by `tests/process-footprints.test.js`, which cross-checks the value against
+`process.memoryUsage().rss` and asserts a path-shaped pid can never reach `/proc/<pid>/`.
+
+### `procps` is required in the FHS env (v1.32352.0)
+
+The app shells out to `ps` and `pgrep`, and neither was in `targetPkgs`. Three things
+broke silently, all caught by empty `catch` blocks:
+
+| Call | Consequence when it fails |
+|---|---|
+| `ps` (child enumeration) | `[process-memory] children=unavailable(ps-failed)` — telemetry only |
+| `ps -o pgid= -o tpgid= -p <pid>` | bash PTY foreground/busy detection always reports "no busy shells" |
+| `pgrep -P <pid>` | the **recursive process-tree killer** walks no children, so only the root is SIGKILLed and grandchildren are orphaned |
+
+The third is the serious one, and it partially compensates for the process-group reaping
+we cannot have (see patch 19). When auditing a bump, grep the bundle for spawned tool
+names and check each against the FHS rootfs — `ls $ROOTFS/usr/bin/<tool>`. The other
+`pgrep` call sites are darwin-gated (iOS Simulator, macOS app detection) and irrelevant.
 
 ### DeviceRegistry hardware key (v1.26832.0)
 
@@ -206,7 +262,7 @@ Covered by `tests/device-key.test.js`, which drives the **real stub module** (wi
 
 ## Testing Gotchas
 
-- **Never launch a test build against the real `~/.config/Claude`.** On startup the app "preseeds" a pinned `claude-code` build into `~/.config/Claude/claude-code/<version>/` (v1.26832.0 pins 2.1.222; v1.24012.9 pinned 2.1.219; v1.20186.1 pinned 2.1.205; v1.13576.4 pinned 2.1.177) and writes a `.verified` marker holding the *manifest's expected checksum* — not a hash of the file. A test launch therefore mutates real user state, and an app version expecting a different pin reports **"The Claude Code binary is missing or damaged."** Run headless tests with an isolated `HOME`, copying in `.config/Claude/claude-code` to skip the 257 MB download.
+- **Never launch a test build against the real `~/.config/Claude`.** On startup the app "preseeds" a pinned `claude-code` build into `~/.config/Claude/claude-code/<version>/` (v1.32352.0 pins 2.1.229; v1.26832.0 pinned 2.1.222; v1.24012.9 pinned 2.1.219; v1.20186.1 pinned 2.1.205; v1.13576.4 pinned 2.1.177) and writes a `.verified` marker holding the *manifest's expected checksum* — not a hash of the file. A test launch therefore mutates real user state, and an app version expecting a different pin reports **"The Claude Code binary is missing or damaged."** Run headless tests with an isolated `HOME`, copying in `.config/Claude/claude-code` to skip the 257 MB download.
 - **Headless launch**: `HOME=$tmp xvfb-run -a ./result/bin/claude-desktop`; surviving a `timeout` (exit 124) is the pass signal. Grep the log for `is not a function`, `Cannot find module`, `UnsafeRootError`.
 - **Two harness traps produce a fake failure (exit 139 / SIGSEGV), not an app bug:**
   1. `XDG_RUNTIME_DIR` must be **short**. A unix socket path is capped at 108 bytes, and the Wayland socket lives under it — a deep scratchpad path makes Ozone abort with `socket path … exceeds 108 bytes` before any window opens. Use something like `/tmp/cdt-$$`.
@@ -219,6 +275,7 @@ Covered by `tests/device-key.test.js`, which drives the **real stub module** (wi
 - **A clean launch is not a working app either.** Subsystems that fail are frequently caught, logged, retried, and degraded — the window still opens. Both v1.24012.9 regressions behaved this way: the disclaimer bug logged a warning and fell back to a bare env, and the missing ASAR `unpacked` entry only threw when something actually opened a terminal. Exercise the feature:
   - `node tests/branding-fix.test.js` — patch 07 stays scoped to chrome (issue #40).
   - `node tests/device-key.test.js` — the DeviceRegistry key contract (patch 00).
+  - `node tests/process-footprints.test.js` — the process-footprint contract (patch 00).
   - `tests/pty-roundtrip` — patch 18 addon resolves, spawns, resizes, exits (see its README).
   - Grep a launch log for `[CCD] Resolved N login-shell env vars`; `Shell environment extraction failed` means patch 19 regressed.
   - Grep for `NotificationService initialized with Electron notifications`. The Swift

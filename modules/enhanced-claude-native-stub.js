@@ -374,6 +374,48 @@ class ClaudeNativeLinux {
     };
   }
 
+  // --- Process footprints (v1.32352.0) ---
+  //
+  // The process-memory telemetry sampler calls this once a minute with an array of
+  // pids. Its guard is `if (!nativeModule) return nulls`, which our stub passes, so a
+  // missing method throws `TypeError: n.readProcessFootprints is not a function` on
+  // every tick — caught and logged as "[process-memory] snapshot failed", never
+  // reported to Sentry, and the sampler reports `children=unavailable` forever.
+  //
+  // Contract, derived from the consumer:
+  //   readProcessFootprints(pids) -> Promise<Array>, parallel to pids, each element
+  //   either null (unavailable) or { footprintBytes, commitBytes }. The caller does
+  //   `r.finally(...)` on the return value immediately, so it must be a real Promise,
+  //   and it races it against a 5s timer whose sentinel is the string "timeout" —
+  //   so never resolve to that.
+  //
+  // macOS reports phys_footprint here. The honest Linux analogue is RSS, read from
+  // /proc/<pid>/status rather than /proc/<pid>/statm: status reports VmRSS in kB
+  // directly, while statm counts pages and would need the page size, which is not
+  // 4096 everywhere this flake builds (aarch64 kernels are commonly 16K or 64K).
+  //
+  // commitBytes stays null. Linux has no clean equivalent of the macOS/Windows commit
+  // charge, the consumer explicitly tolerates null (`e.commitBytes ?? null`), and
+  // inventing a mapping would put wrong numbers into telemetry.
+  async readProcessFootprints(pids) {
+    const list = Array.isArray(pids) ? pids : [];
+    return Promise.all(
+      list.map(async (pid) => {
+        const id = Number(pid);
+        if (!Number.isInteger(id) || id <= 0) return null;
+        try {
+          const status = await fsp.readFile(`/proc/${id}/status`, 'utf8');
+          const match = /^VmRSS:\s+(\d+)\s+kB$/m.exec(status);
+          if (!match) return null;
+          return { footprintBytes: Number(match[1]) * 1024, commitBytes: null };
+        } catch {
+          // Process exited between enumeration and read, or is not ours to inspect.
+          return null;
+        }
+      }),
+    );
+  }
+
   hardwareKeySign(alias, data) {
     const crypto = require('crypto');
     const key = loadOrCreateDeviceKey(alias);

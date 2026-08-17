@@ -1,8 +1,23 @@
 # Cowork on Linux - Progress Report
 
-## Current Status: v1.26832.0 — Cowork + Code/LOCAL Functional
+## Current Status: v1.32352.0 — Cowork + Code/LOCAL Functional
 
 Cowork is running on Linux via a fully declarative Nix flake. Claude Code spawns inside Cowork sessions, processes messages via the SDK wire protocol, streams responses, and persists transcripts across app restarts.
+
+**v1.32352.0 bump** — the first real test of the anchor-keyed patch chain, and it passed.
+
+- **The bundle was re-chunked again, in the opposite direction** (≈350 JS files down to 140, `index.js` back to a 625-byte stub with 2 requires, nearly everything consolidated into one 6 MB chunk). **13 of 16 patches applied with no edit at all.** Only the three whose target *code* actually changed needed work. Under the old filename-resolution rule this would have been another all-patches-fail release.
+- **Patch 03 re-anchored.** The availability function was restructured (two early-return `if`s became one `if` plus a cached `return c||(…)`), killing a purely structural anchor. Now keyed on the `CLAUDE_E2E_ASSUME_VM_SUPPORTED` literal, which is unique to that function and has survived two refactors.
+- **Patch 08b re-derived.** The tray-icon switch changed from assign-then-`break` to direct `return`s, and the `png` case gained a force-dark flag. The rewrite now captures the whole condition opaquely and reuses it.
+- **Patch 19 re-derived, and it grew a correctness question.** The wrapper now returns `processGroupLeader`, which selects the transport class. We must return `false`: the process-group transport arms a reaper calling `process.kill(-pid)`, and the child is only a group leader because the macOS helper was invoked with `--pgroup`. With the helper bypassed nothing creates the group, so claiming `true` would give a reaper whose kills silently fail. Cost: MCP server subtrees are not group-reaped on Linux — a capability that arrived this release and has never worked here, since it lives inside a macOS-only binary.
+- **Patch 05 had a latent landmine, found by this bump.** Its forward regex could *start* at one function and *run into* a later function's `[VM:start]` log. In v1.32352.0 `deleteVMBundle` sits 3957 chars before the log call — inside the 4000-char window — so it was silently selected, and Cowork session creation would have been injected into the bundle-**deletion** routine with a completely green build. Earlier releases escaped only by accident: the signature hardcoded four parameters and `deleteVMBundle` takes none; this release dropped the VM start fn to three params and removed that accidental filter. Discovery now walks backwards from the log call to the nearest preceding `async function`, which structurally cannot select the wrong one.
+- **Two more silent breakages, both found by *running* the app rather than building it — and each needed a different kind of session.**
+  - **`readProcessFootprints` missing from the native stub.** New in this release; the process-memory sampler calls it on a once-a-minute timer behind a bare truthiness guard, so it threw every tick. A 60-second headless run misses this entirely — it took a 15-minute signed-in session to accumulate 15 identical `TypeError`s, with **zero** Sentry events and zero `[error]` lines. Implemented as RSS from `/proc/<pid>/status` (`VmRSS` in kB, so no page-size assumption — aarch64 is not always 4K), with `commitBytes` honestly null.
+  - **`procps` was never in the FHS env.** The app shells out to `ps` and `pgrep`; neither existed, and all three uses fail into empty `catch` blocks. Telemetry lost child enumeration; bash-PTY foreground detection always reported "no busy shells"; and worst, the **recursive process-tree killer** (`pgrep -P` walking children before SIGKILL) walked nothing, so only the root process died and grandchildren were orphaned. That last one partially offsets the process-group reaping patch 19 cannot give us.
+  - Verified live: `children=unavailable(ps-failed)` → `children(3)=132MB`, and `tree_footprint_sum` now reported where it was previously absent.
+- `claude-code` pin moved 2.1.222 → **2.1.229**. node-pty stayed `1.2.0-beta.14`.
+
+Validated on v1.32352.0: `nix flake check` green, headless launch clean (exit 124, **0 Sentry events**), `NotificationService initialized with Electron notifications`, `[CCD] Resolved 46 login-shell env vars`, Cowork up via bubblewrap 0.11.0, PTY round-trip 6/6, branding 13/13, device-key 15/15, process-footprints 18/18. A **signed-in** live launch on a real Wayland session was also clean: tray icon registered with the StatusNotifierWatcher, 0 Sentry events, 0 `is not a function`, and no DeviceRegistry errors at all (the persisted device key from v1.26832.0 carried over).
 
 **v1.26832.0 bump** — the loudest structural bump so far. Two independent, simultaneous changes broke nearly the whole chain, and a third class of bug was found by launching rather than building:
 
@@ -126,5 +141,5 @@ User sends message in Cowork UI
 
 ---
 
-**Last Updated**: 2026-08-10
-**Claude Desktop Version**: 1.26832.0
+**Last Updated**: 2026-08-18
+**Claude Desktop Version**: 1.32352.0

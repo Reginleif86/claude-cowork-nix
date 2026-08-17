@@ -9,9 +9,9 @@
   outputs = { self, nixpkgs, flake-utils }:
     let
       # Claude Desktop version and source
-      claudeVersion = "1.26832.0";
-      claudeDmgHash = "sha256-fUcfeYc3dxc98HceNuybRMshC13Hlv1se1KbSIMOtdc=";
-      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/1.26832.0/Claude-056ee2be623b207f6a4d24dfb1b2fb5a82db0ecf.dmg";
+      claudeVersion = "1.32352.0";
+      claudeDmgHash = "sha256-z8/Thkt8VRRsA+qYL0wQnL/nqU52UM1btmVPXq306Lc=";
+      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/1.32352.0/Claude-e33b9a2c87bcb6d670dae34471d8b60f7aa790ae.dmg";
 
       # node-pty version bundled inside the DMG's app.asar. The Linux pty.node we
       # overlay (patch 18b) is built from this exact version — N-API keeps the ABI
@@ -309,10 +309,23 @@
               # Both are global to this build, so `(?:const|let)` and `[`"]` appear in
               # every regex below — writing them as wildcards costs nothing and means a
               # future minifier flip back does not break the chain again.
+              # v1.32352.0 restructured this function. It used to be
+              #   f(){let a=override();if(a)return a;if(CACHE)return CACHE;
+              #      let b=platformCheck();if(b.status!=="supported")…}
+              # and is now
+              #   f(){let a=override();if(a)return a;let b=CACHE;
+              #      return b||(b=env("CLAUDE_E2E_ASSUME_VM_SUPPORTED")||…,CACHE=b,…),gate(b)}
+              # so the old anchor (two consecutive early-return ifs, then a .status test)
+              # no longer exists. Anchor on the CLAUDE_E2E_ASSUME_VM_SUPPORTED literal
+              # instead: it is unique to this function and survives renaming, which the
+              # structural prefix demonstrably does not.
+              # The injection point is unchanged — first statement of the function — so
+              # Linux still short-circuits ahead of the cache and the enterprise gate,
+              # exactly as before.
               echo "[patch:03] Patching Cowork availability..."
               apply_patch 03 \
-                'function [\w\$]+\(\)\{(?:const|let) [\w\$]+=[\w\$]+\(\);if\([\w\$]+\)return [\w\$]+;if\([\w\$]+\)return [\w\$]+;(?:const|let) [\w\$]+=[\w\$]+\(\);if\([\w\$]+\.status!==' \
-                's{(function )([\w\$]+)(\(\)\{)((?:const|let) [\w\$]+=[\w\$]+\(\);if\([\w\$]+\)return [\w\$]+;if\([\w\$]+\)return [\w\$]+;(?:const|let) [\w\$]+=[\w\$]+\(\);if\([\w\$]+\.status!==[`"]supported[`"])}{$1$2$3if(process.platform==="linux"&&global.__linuxCowork)return{status:"supported"};$4}g' \
+                'CLAUDE_E2E_ASSUME_VM_SUPPORTED' \
+                's{(function ([\w\$]+)\(\)\{)((?:const|let) [\w\$]+=[\w\$]+\(\);if\([\w\$]+\)return [\w\$]+;(?:const|let) [\w\$]+=[\w\$]+;return [\w\$]+\|\|\([\w\$]+=[\w\$]+\([`"]CLAUDE_E2E_ASSUME_VM_SUPPORTED[`"]\))}{$1if(process.platform==="linux"&&global.__linuxCowork)return{status:"supported"};$3}g' \
                 'if\(process\.platform==="linux"&&global\.__linuxCowork\)return\{status:"supported"\}'
               echo "[patch:03] Done"
 
@@ -431,10 +444,16 @@
               # (`p.rt()` rather than a local `de()`), so the captured callee must allow
               # dots. Quote style is captured (\1) and reused.
               echo "[patch:08b] Patching tray icon filename selection..."
+              # v1.32352.0 turned the switch from assign-then-break into direct
+              # returns, and gave the "png" case an extra leading term (a force-dark
+              # flag the caller passes when retrying after a tray crash). Rather than
+              # re-spell that condition, capture it whole ([^;]+? — it contains no
+              # semicolon) and reuse it, so upstream can keep changing what feeds the
+              # dark/light choice without breaking us.
               apply_patch 08b \
-                'case[`"]template-image[`"]:[\w\$]+=[`"]TrayIconTemplate\.png[`"];break;' \
-                's{case([`"])template-image\1:([\w\$]+)=\1TrayIconTemplate\.png\1;break;(case\1png\1:\2=([\w\$.]+)\(\)===\1gnome\1\|\|([\w\$.]+)\.nativeTheme\.shouldUseDarkColors\?\1TrayIconLinux-Dark\.png\1:\1TrayIconLinux\.png\1;break)}{case$1template-image$1:$2=process.platform==="linux"?($4()==="gnome"||$5.nativeTheme.shouldUseDarkColors?"TrayIconLinux-Dark.png":"TrayIconLinux.png"):"TrayIconTemplate.png";break;$3}g' \
-                'case[`"]template-image[`"]:[\w\$]+=process\.platform==="linux"\?\([\w\$.]+\(\)==="gnome"\|\|[\w\$.]+\.nativeTheme\.shouldUseDarkColors\?"TrayIconLinux-Dark\.png":"TrayIconLinux\.png"\):"TrayIconTemplate\.png"'
+                'case[`"]template-image[`"]:return[`"]TrayIconTemplate\.png[`"];' \
+                's{case([`"])template-image\1:return\1TrayIconTemplate\.png\1;(case\1png\1:return ([^;]+?)\?\1TrayIconLinux-Dark\.png\1:\1TrayIconLinux\.png\1)}{case$1template-image$1:return process.platform==="linux"?($3?"TrayIconLinux-Dark.png":"TrayIconLinux.png"):"TrayIconTemplate.png";$2}g' \
+                'case[`"]template-image[`"]:return process\.platform==="linux"\?\('
               echo "[patch:08b] Done"
 
               # --- Patch 09: RETIRED (v1.26832.0) ---
@@ -670,10 +689,31 @@
               # "Helpers"/"disclaimer" path join, which sits in the same bundle as every
               # wrapper it feeds.
               echo "[patch:19] Bypassing macOS disclaimer spawn helper..."
+              # v1.32352.0 gave the wrapper process-group support:
+              #   function w(o){o.cmd,o.args;let d=disclaimerPath(),g=o.processGroup===!0;
+              #                 return{cmd:d,args:[...g?["--pgroup"]:[],o.cmd,...o.args],
+              #                        processGroupLeader:g}}
+              # so the return object now carries a third key and the args array has a
+              # spread prefix — the old shape-matching regex no longer fits.
+              # Match on the vestigial `o.cmd,o.args;` expression statement instead. It is
+              # a dead no-op the minifier left behind, unique to this function, and it
+              # keeps the parameter backreference that stops a Windows PowerShell helper
+              # elsewhere in the tree (which also returns {cmd,args}) from being rewritten.
+              #
+              # processGroupLeader must be false on Linux. It selects the transport class:
+              # the process-group one arms a reaper that calls process.kill(-pid), which
+              # only works if the child really is a group leader — and on macOS it is only
+              # a leader because the disclaimer helper was invoked with --pgroup. With the
+              # helper bypassed nothing creates the group, so claiming true would give a
+              # reaper whose kills silently fail. Returning false selects the plain
+              # transport, which kills the child directly.
+              # Trade-off, and it is upstream's to give us: MCP server subtrees are not
+              # group-reaped on Linux. That capability arrived with this release and has
+              # never worked here, because it is implemented inside a macOS-only binary.
               apply_patch 19 \
                 '[`"]Helpers[`"]\s*,\s*[`"]disclaimer[`"]' \
-                's{(function\s+([\w\$]+)\s*\(\s*([\w\$]+)\s*\)\s*\{)(\s*(?:(?:const|let|var)\s+[\w\$]+\s*=\s*[\w\$]+\(\)\s*;)?\s*return\s*\{\s*cmd\s*:\s*[\w\$]+(?:\(\))?\s*,\s*args\s*:\s*\[\s*\3\.cmd\s*,\s*\.\.\.\s*\3\.args\s*,?\s*\]\s*,?\s*\}\s*;?\s*\})}{$1if(process.platform!=="darwin")return\{cmd:$3.cmd,args:$3.args\};$4}gs' \
-                'if\(process\.platform!=="darwin"\)return\{cmd:[\w\$]+\.cmd,args:[\w\$]+\.args\}'
+                's{(function\s+[\w\$]+\s*\(\s*([\w\$]+)\s*\)\s*\{)(\s*\2\.cmd\s*,\s*\2\.args\s*;)}{$1if(process.platform!=="darwin")return\{cmd:$2.cmd,args:$2.args,processGroupLeader:!1\};$3}gs' \
+                'if\(process\.platform!=="darwin"\)return\{cmd:[\w\$]+\.cmd,args:[\w\$]+\.args,processGroupLeader:!1\}'
               echo "[patch:19] Done"
 
               # --- Patch 20: Swift notification backend must not engage on Linux (regex) ---
@@ -933,6 +973,13 @@
               openssl
               docker-client
               coreutils
+              # procps supplies `ps`, which the app shells out to for two things:
+              # per-child memory enumeration (without it the process-memory sampler
+              # logs children=unavailable(ps-failed) forever) and, more importantly,
+              # `ps -o pgid= -o tpgid= -p <pid>` to decide whether a bash PTY has a
+              # foreground job running. That second one is a real feature, not
+              # telemetry, and it silently reported "no busy shells" without this.
+              procps
               bash
               gnugrep
               gnused

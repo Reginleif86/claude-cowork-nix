@@ -3,7 +3,7 @@
  * Dynamic VM Start Intercept Patch
  *
  * Discovers the VM start function by its semantic signature (the [VM:start]
- * log string and 4-param async function pattern), then injects a Linux
+ * log string and an async function of any arity), then injects a Linux
  * bubblewrap session block before the original function body.
  *
  * Version-resilient — discovers identifiers at build time, not hardcoded.
@@ -35,27 +35,58 @@ console.log('=== Dynamic Patch: VM Start Intercept ===\n');
 
 let content = fs.readFileSync(INDEX_JS_PATH, 'utf8');
 
-// Discover function signature by matching the stable pattern:
-//   async function WORD(WORD,WORD,WORD,WORD){<decl>; <arbitrary setup>; WORD.info(`[VM:start]
-// The arbitrary-setup window covers version-to-version drift such as the
-// condadata.* / operon-* cleanup loops added in v1.6608.x. The capture is
-// anchored on the function header + leading declaration + first [VM:start] log
-// call, which together produce a unique substring suitable for `replace()`.
-// The declaration keyword must stay a wildcard: through v1.24012.9 the minifier
-// emitted bare hoisted `var a,b;`, v1.26832.0 emits `let a=f(),b=Date.now(),...`.
-const sigRegex = /async function (\w+)\((\w+),(\w+),(\w+),(\w+)\)\{((?:var|let|const) [\s\S]{0,4000}?\w+\.info\(`\[VM:start\])/;
-const sigMatch = content.match(sigRegex);
+// Locate the VM start function by walking BACKWARDS from its log call.
+//
+// The obvious approach — one forward regex of the form
+//   /async function (\w+)\(([^)]*)\)\{(decl [\s\S]{0,4000}?\[VM:start\])/
+// — is actively dangerous, because the lazy window lets the match START at an
+// earlier function and RUN FORWARD into a later function's [VM:start] log. In
+// v1.32352.0 that is not hypothetical: `deleteVMBundle` sits 3957 characters
+// before the log line, inside a 4000-character window, so the forward regex
+// silently selected it. Injecting Cowork session creation into the bundle
+// *deletion* routine would have produced no build error at all.
+// Earlier versions were saved only by an incidental filter — the signature
+// hardcoded four parameters, and deleteVMBundle takes none. That filter died
+// with v1.32352.0, which dropped the VM start function to three parameters.
+//
+// So: find the log call, then take the NEAREST preceding `async function` head.
+// lastIndexOf guarantees no other `async function` lies between the two, which
+// is exactly the property the forward regex could not provide.
+const logMatch = /[\w$]+\.info\(`\[VM:start\]/.exec(content);
+if (!logMatch) {
+  console.error('  ERROR: Could not find the [VM:start] log call');
+  process.exit(1);
+}
+const headIdx = content.lastIndexOf('async function', logMatch.index);
+if (headIdx < 0) {
+  console.error('  ERROR: No async function precedes the [VM:start] log call');
+  process.exit(1);
+}
+const span = logMatch.index - headIdx;
+if (span > 8000) {
+  console.error(`  ERROR: nearest async function is ${span} chars before [VM:start];`);
+  console.error('         the enclosing function is probably not a plain `async function`');
+  process.exit(1);
+}
+
+// The parameter list is captured as raw text and re-emitted verbatim: the arity is
+// not stable (four params through v1.26832.0, three in v1.32352.0) and nothing in
+// the injected body refers to these parameters. The declaration keyword after `{`
+// is a wildcard for the same reason (`var` through v1.24012.9, `let` since).
+const segment = content.slice(headIdx, logMatch.index + logMatch[0].length);
+const sigMatch = /^async function (\w+)\(([^)]*)\)\{((?:var|let|const) [\s\S]*)$/.exec(segment);
 
 if (!sigMatch) {
-  console.error('  ERROR: Could not find VM start function via [VM:start] pattern');
+  console.error('  ERROR: Could not parse the VM start function signature');
+  console.error(`  segment began: ${segment.slice(0, 120)}`);
   process.exit(1);
 }
 
 const funcName = sigMatch[1];
-const params = [sigMatch[2], sigMatch[3], sigMatch[4], sigMatch[5]];
-const originalBody = sigMatch[6];
+const paramList = sigMatch[2]; // raw source text, reused verbatim
+const originalBody = sigMatch[3];
 
-console.log(`  Found VM start function: ${funcName}(${params.join(',')})`);
+console.log(`  Found VM start function: ${funcName}(${paramList})`);
 
 // Discover status dispatch: WORD(WORD.Ready) near VM startup code
 // Look for patterns like YF(Yw.Ready) or similar near [Heartbeat] or lam_vm_startup.
@@ -75,7 +106,7 @@ if (statusMatch) {
 }
 
 // Build the injection block
-const injection = `async function ${funcName}(${params.join(',')}){
+const injection = `async function ${funcName}(${paramList}){
   if(process.platform==="linux"&&global.__linuxCowork&&!global.__linuxCowork.vmInstance){
     console.log("[Cowork Linux] Creating session");
     const {manager}=global.__linuxCowork;
@@ -209,7 +240,7 @@ const injection = `async function ${funcName}(${params.join(',')}){
   ${originalBody}`;
 
 // Find and replace the original function start
-const originalStart = `async function ${funcName}(${params.join(',')}){${originalBody}`;
+const originalStart = `async function ${funcName}(${paramList}){${originalBody}`;
 
 if (!content.includes(originalStart)) {
   console.error('  ERROR: Could not locate original function for replacement');
