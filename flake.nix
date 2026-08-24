@@ -9,9 +9,9 @@
   outputs = { self, nixpkgs, flake-utils }:
     let
       # Claude Desktop version and source
-      claudeVersion = "1.32352.0";
-      claudeDmgHash = "sha256-z8/Thkt8VRRsA+qYL0wQnL/nqU52UM1btmVPXq306Lc=";
-      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/1.32352.0/Claude-e33b9a2c87bcb6d670dae34471d8b60f7aa790ae.dmg";
+      claudeVersion = "1.34493.1";
+      claudeDmgHash = "sha256-Ko+H9S5piLk6z3kuCt1HxKrkf6lO8d+vY7EP3vhAUM4=";
+      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/1.34493.1/Claude-255293a41a25d54c5177aa9614fb4cd620e70b78.dmg";
 
       # node-pty version bundled inside the DMG's app.asar. The Linux pty.node we
       # overlay (patch 18b) is built from this exact version — N-API keeps the ABI
@@ -325,7 +325,7 @@
               echo "[patch:03] Patching Cowork availability..."
               apply_patch 03 \
                 'CLAUDE_E2E_ASSUME_VM_SUPPORTED' \
-                's{(function ([\w\$]+)\(\)\{)((?:const|let) [\w\$]+=[\w\$]+\(\);if\([\w\$]+\)return [\w\$]+;(?:const|let) [\w\$]+=[\w\$]+;return [\w\$]+\|\|\([\w\$]+=[\w\$]+\([`"]CLAUDE_E2E_ASSUME_VM_SUPPORTED[`"]\))}{$1if(process.platform==="linux"&&global.__linuxCowork)return{status:"supported"};$3}g' \
+                's{(function ([\w\$]+)\(\)\{)((?:(?!function).)*?if\((?:(?!function).)*?[`"]CLAUDE_E2E_ASSUME_VM_SUPPORTED[`"])}{$1if(process.platform==="linux"&&global.__linuxCowork)return{status:"supported"};$3}gs' \
                 'if\(process\.platform==="linux"&&global\.__linuxCowork\)return\{status:"supported"\}'
               echo "[patch:03] Done"
 
@@ -343,8 +343,8 @@
               # branch upstream takes when the feature is unsupported.
               echo "[patch:04] Patching download skip..."
               apply_patch 04 \
-                'async function [\w\$]+\([\w\$]+,[\w\$]+\)\{(?:const|let)\{yukonSilver:' \
-                's{(async function [\w\$]+\([\w\$]+,[\w\$]+\)\{)((?:const|let)\{yukonSilver:[\w\$]+\}=.{0,220}?\[downloadVM\])}{$1if(process.platform==="linux"&&global.__linuxCowork){console.log("[Cowork Linux] Skipping bundle download");return!1}$2}gs' \
+                'async function [\w\$]+\([\w\$]+,[\w\$]+\)\{(?:await [\w\$.]+\(\);)*(?:const|let)\{yukonSilver:' \
+                's{(async function [\w\$]+\([\w\$]+,[\w\$]+\)\{)((?:await [\w\$.]+\(\);)*(?:const|let)\{yukonSilver:[\w\$]+\}=.{0,220}?\[downloadVM\])}{$1if(process.platform==="linux"&&global.__linuxCowork){console.log("[Cowork Linux] Skipping bundle download");return!1}$2}gs' \
                 'if\(process\.platform==="linux"&&global\.__linuxCowork\)\{console\.log\("\[Cowork Linux\] Skipping bundle download"\)'
               echo "[patch:04] Done"
 
@@ -689,31 +689,56 @@
               # "Helpers"/"disclaimer" path join, which sits in the same bundle as every
               # wrapper it feeds.
               echo "[patch:19] Bypassing macOS disclaimer spawn helper..."
-              # v1.32352.0 gave the wrapper process-group support:
-              #   function w(o){o.cmd,o.args;let d=disclaimerPath(),g=o.processGroup===!0;
-              #                 return{cmd:d,args:[...g?["--pgroup"]:[],o.cmd,...o.args],
-              #                        processGroupLeader:g}}
-              # so the return object now carries a third key and the args array has a
-              # spread prefix — the old shape-matching regex no longer fits.
-              # Match on the vestigial `o.cmd,o.args;` expression statement instead. It is
-              # a dead no-op the minifier left behind, unique to this function, and it
-              # keeps the parameter backreference that stops a Windows PowerShell helper
-              # elsewhere in the tree (which also returns {cmd,args}) from being rewritten.
+              # v1.34493.1 changed the fix, and for the better. Earlier releases had a
+              # wrapper with no non-darwin escape at all, so the patch had to rewrite the
+              # wrapper's own return shape — and that shape moved every release (v1.32352.0
+              # added process groups and a third return key, killing the previous regex).
+              # Upstream now ships its own no-helper fallback:
+              #   function resolve(){{let d=dirname(process.resourcesPath);
+              #                       return join(d,`Helpers`,`disclaimer`)}}
+              #   function get(){return resolve()}
+              #   function wrap(o){let t=get();
+              #     if(!t)return{cmd:o.cmd,args:o.args,processGroupLeader:!1};
+              #     let g=o.processGroup===!0;
+              #     return{cmd:t,args:[...g?[`--pgroup`]:[],`--`,o.cmd,...o.args],
+              #            processGroupLeader:g}}
+              # so making the *resolver* return null on non-darwin routes the caller onto
+              # upstream's own pass-through — the same "fix at the loader, not the call
+              # site" principle patches 20 and 21 follow. Three things this buys us:
+              #   - The pass-through already sets processGroupLeader:!1, so we no longer
+              #     hand-write that invariant (see below for why it must be false).
+              #   - It also covers the second wrapper, the `--ports-only` variant, which
+              #     reads the same resolver and returns its argument unchanged on null.
+              #     The old call-site patch never touched it.
+              #   - No parameter backreference is needed any more. The old regex carried
+              #     one to stop a Windows PowerShell helper elsewhere in the tree (which
+              #     also returns {cmd,args}) from being rewritten; anchoring on the
+              #     Helpers/disclaimer path join is inherently unique to this resolver.
+              # Note the injection lands inside the vestigial bare `{...}` block — the
+              # fossil of a dead-code-eliminated `if(process.platform==="darwin")`. A
+              # return inside a bare block still returns from the function.
               #
-              # processGroupLeader must be false on Linux. It selects the transport class:
-              # the process-group one arms a reaper that calls process.kill(-pid), which
-              # only works if the child really is a group leader — and on macOS it is only
-              # a leader because the disclaimer helper was invoked with --pgroup. With the
-              # helper bypassed nothing creates the group, so claiming true would give a
-              # reaper whose kills silently fail. Returning false selects the plain
-              # transport, which kills the child directly.
+              # Why processGroupLeader must be false on Linux: it selects the transport
+              # class. The process-group transport arms a reaper that calls
+              # process.kill(-pid), which only works if the child really is a group leader
+              # — and on macOS it is one only because the disclaimer helper was invoked
+              # with --pgroup. With the helper bypassed nothing creates the group, so
+              # claiming true would give a reaper whose kills silently fail.
               # Trade-off, and it is upstream's to give us: MCP server subtrees are not
-              # group-reaped on Linux. That capability arrived with this release and has
-              # never worked here, because it is implemented inside a macOS-only binary.
+              # group-reaped on Linux. That capability is implemented inside a macOS-only
+              # binary, so it has never worked here. The recursive `pgrep -P` tree killer
+              # partially compensates — which is why procps must stay in the FHS env.
+              #
+              # Both copies are minified in this release, but the shapes have alternated
+              # before (fileIndexWorker.js was pretty-printed through v1.26832.0), so the
+              # regex stays whitespace-flexible and runs in -0777 slurp mode. Site count
+              # is discovered from the anchor, never hardcoded: it was 3 through
+              # v1.24012.9, 2 since. Both sites must apply — one unguarded resolver is
+              # every spawn in that process ENOENTing.
               apply_patch 19 \
                 '[`"]Helpers[`"]\s*,\s*[`"]disclaimer[`"]' \
-                's{(function\s+[\w\$]+\s*\(\s*([\w\$]+)\s*\)\s*\{)(\s*\2\.cmd\s*,\s*\2\.args\s*;)}{$1if(process.platform!=="darwin")return\{cmd:$2.cmd,args:$2.args,processGroupLeader:!1\};$3}gs' \
-                'if\(process\.platform!=="darwin"\)return\{cmd:[\w\$]+\.cmd,args:[\w\$]+\.args,processGroupLeader:!1\}'
+                's{(function\s+[\w\$]+\s*\(\s*\)\s*\{\s*\{\s*)((?:const|let)\s+[\w\$]+\s*=\s*[\w\$.]+\.dirname\(process\.resourcesPath\)\s*;\s*return\s+[\w\$.]+\.join\([\w\$]+\s*,\s*[`"]Helpers[`"]\s*,\s*[`"]disclaimer[`"]\))}{$1if(process.platform!=="darwin")return null;$2}gs' \
+                'if\(process\.platform!=="darwin"\)return null;\s*(?:const|let)\s+[\w\$]+\s*=\s*[\w\$.]+\.dirname\(process\.resourcesPath\)'
               echo "[patch:19] Done"
 
               # --- Patch 20: Swift notification backend must not engage on Linux (regex) ---
@@ -779,6 +804,66 @@
                 's{(async function [\w\$]+\(\)\{)(return [\w\$]+\|\|[\w\$]+\|\|\([\w\$.]+\.info\([`"]\[VM\] Loading)}{$1if(process.platform!=="darwin")return null;$2}g' \
                 'if\(process\.platform!=="darwin"\)return null;return [\w\$]+\|\|'
               echo "[patch:21] Done"
+
+              # --- Patch 22: Linux single-instance + claude:// deep-link delivery ---
+              # Fixes #52 and #57. Ported from PR #53 (thanks @stuckj); renumbered from
+              # that PR's "20" because 20 and 21 were taken in the meantime, and
+              # re-anchored because the flake moved from a single $INDEX to anchor-based
+              # discovery.
+              #
+              # v1.24012.9 dropped the non-darwin arm of the main process's deep-link
+              # setup. Through v1.9255.2 it branched on platform:
+              #   isMac ? (app.on("open-url", ...), app.on("continue-activity", ...))
+              #         : app.requestSingleInstanceLock()
+              #             ? app.on("second-instance", (e,argv)=>{focus();dispatch(argv)})
+              #             : app.quit();
+              # Since then it registers open-url, will-continue-activity and
+              # continue-activity unconditionally — and all three are macOS-only Electron
+              # events. requestSingleInstanceLock and second-instance are absent from the
+              # entire tree, and there is no cold-start argv scan for the scheme.
+              #
+              # On Linux that means every `claude-desktop claude://...` (i.e. every
+              # xdg-open of the scheme handler) starts a second full app against one
+              # --user-data-dir, and the URL sits unread in its argv. Since the in-process
+              # auth path (ASWebAuthenticationSession) is macOS-only, OAuth sign-in cannot
+              # complete at all: the callback never gets back in, so the "sign in again"
+              # banner is permanent and every attempt opens another window.
+              #
+              # Appended rather than substituted because there is no surviving call site
+              # to rewrite — the arm is gone, not renamed. Appended to index.js for the
+              # same reason patch 01 is: it is the entry that requires every chunk, so the
+              # append runs after the app has registered its own "open-url" listener but
+              # before "ready" — the only window in which requestSingleInstanceLock() is
+              # still useful. The script re-emits that listener rather than reimplementing
+              # dispatch (the app already owns mainView readiness, the pending-URL stash
+              # and window focus), so the only structural assumption is that the listener
+              # exists — which is what the first assertion pins.
+              #
+              # The listener grep must accept a backtick: this build minifies every string
+              # literal to a template literal, so it is app.on(`open-url`, not
+              # app.on("open-url"). PR #53's double-quote-only assertion would fail here.
+              #
+              # The second assertion is the drop-this-patch tripwire: if upstream restores
+              # the non-darwin arm itself, the build fails loudly rather than installing
+              # two competing single-instance handlers.
+              echo "[patch:22] Restoring Linux deep-link handling..."
+              if [ -z "$(targets_for 'app\.on\(\s*[`"]open-url[`"]')" ]; then
+                echo "ERROR: patch 22 — no app.on(\`open-url\`) listener anywhere in the build tree;"
+                echo "  the dispatch this patch re-emits into is gone. Re-derive before shipping."
+                exit 1
+              fi
+              if [ -n "$(targets_for 'requestSingleInstanceLock')" ]; then
+                echo "ERROR: patch 22 — the app requests a single-instance lock again."
+                echo "  Upstream likely restored the non-darwin arm; drop this patch rather"
+                echo "  than installing a second competing handler."
+                exit 1
+              fi
+              cat ${./scripts/linux-deep-link.js} >> "$BUILD_DIR/index.js"
+              grep -qP 'requestSingleInstanceLock' "$BUILD_DIR/index.js" \
+                || { echo "ERROR: patch 22 (deep-link handling) failed to apply"; exit 1; }
+              ${pkgs.nodejs}/bin/node --check "$BUILD_DIR/index.js" \
+                || { echo "ERROR: patch 22 — index.js no longer parses after append"; exit 1; }
+              echo "[patch:22] Done"
 
               # --- Post-patch syntax sweep ---
               # Every rewrite above is a regex against minified JavaScript, where a

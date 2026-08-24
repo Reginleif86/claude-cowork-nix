@@ -1,8 +1,63 @@
 # Cowork on Linux - Progress Report
 
-## Current Status: v1.32352.0 — Cowork + Code/LOCAL Functional
+## Current Status: v1.34493.1 — Cowork + Code/LOCAL Functional, OAuth sign-in fixed
 
 Cowork is running on Linux via a fully declarative Nix flake. Claude Code spawns inside Cowork sessions, processes messages via the SDK wire protocol, streams responses, and persists transcripts across app restarts.
+
+**v1.34493.1 bump** — a quiet release for the build, and the one where a long-standing
+*user-facing* bug finally got fixed.
+
+- **12 of 15 regex patches applied untouched.** The chunk layout barely moved (140 → 148 JS
+  files, `index.js` still a stub with 2 requires). All three failures were genuine target
+  changes, and the whole damage report came from one offline dry-run pass against an
+  extracted copy rather than three hour-long serial `nix build`s.
+- **Patch 03 lost the property it was anchored on.** v1.32352.0 re-keyed it to the
+  `CLAUDE_E2E_ASSUME_VM_SUPPORTED` literal on the grounds that the literal was *unique to
+  that function*. It is not any more: a sibling one-liner now also reads it and returns a
+  **boolean**, where injecting a status object would be quietly wrong. The regex is now
+  tempered (`(?:(?!function).)*?`, so a match cannot start in one function and end at
+  another's anchor — the patch-05 failure mode expressed in regex form) and discriminating
+  (a required intervening `if(`, which the boolean sibling does not have).
+- **Patch 04**: an `await …();` appeared between the opening brace and the
+  `{yukonSilver:…}` destructure, breaking a head-adjacent anchor. The anchor now tolerates
+  leading `await ident();` statements.
+- **Patch 19 got structurally simpler, because upstream met us halfway.** The wrapper now
+  carries its own no-helper fallback (`if(!t)return{cmd,args,processGroupLeader:!1}`), so
+  the patch stopped rewriting the wrapper — whose return shape had changed *every single
+  release* — and instead makes the **resolver** return null on non-darwin, routing into
+  upstream's own pass-through. Same "fix at the loader, not the call site" principle as
+  patches 20 and 21. It also picks up the `--ports-only` wrapper for free, which the old
+  call-site patch never touched, and hands the `processGroupLeader:!1` invariant back to
+  upstream to maintain.
+- **Issues #52 and #57 fixed — this is the headline.** Both reported the same thing from
+  different angles: Google/OAuth sign-in never completes, and every attempt opens another
+  window still showing the login screen. Root cause (diagnosed by @stuckj in #52) is that
+  v1.24012.9 dropped the **non-darwin arm** of the deep-link setup, so on Linux there is no
+  single-instance lock and no consumer for `claude://` at all — every `xdg-open` of the
+  scheme starts a second full app with the callback URL sitting unread in its argv. Since
+  the in-process auth path is macOS-only, sign-in was simply unreachable. Shipped as
+  **patch 22** (`scripts/linux-deep-link.js`), ported from PR #53. Two corrections were
+  needed against this release: the listener assertion had to accept a **backtick** (this
+  build minifies every string to a template literal, so PR #53's `app.on("open-url"` grep
+  would have failed the build with the listener present), and the append target moved from
+  the retired `$INDEX` to `index.js`.
+- **The bug class here is worth naming.** #57 spent its investigation on XDG handlers,
+  libsecret, D-Bus, the bwrap mount set and browser extensions — all correctly ruled out —
+  and reasonably concluded the OAuth *request* must be malformed. It was not: the request
+  was fine and the *response* had nowhere to land. Nothing crashed, no Sentry event fired,
+  and the app looked healthy. `tests/deep-link` now covers it with two real Electron
+  processes, plus a negative control, because no single-process launch can see it.
+- `claude-code` pin moved 2.1.229 → **2.1.237**. node-pty stayed `1.2.0-beta.14`. No new
+  `@ant/claude-native` methods this release, and no new `{}`-is-truthy Swift consumers.
+
+Validated on v1.34493.1: `nix flake check` green, headless launch clean (exit 124,
+**0 Sentry events**, 0 `[error]` lines, 0 `is not a function`, 0 `Cannot find module`),
+`NotificationService initialized with Electron notifications`, `[CCD] Resolved 46
+login-shell env vars` (confirming the rewritten patch 19), `SingletonLock`/`SingletonSocket`
+created, a live second instance carrying a `claude://login/google-auth?code=…` argv exited
+0 without opening a window, Cowork up via bubblewrap 0.11.0, PTY round-trip 6/6, deep-link
+4/4 (and 3 FAILs under its negative control), branding 13/13, device-key 15/15,
+process-footprints 18/18.
 
 **v1.32352.0 bump** — the first real test of the anchor-keyed patch chain, and it passed.
 
@@ -141,5 +196,5 @@ User sends message in Cowork UI
 
 ---
 
-**Last Updated**: 2026-08-18
-**Claude Desktop Version**: 1.32352.0
+**Last Updated**: 2026-08-24
+**Claude Desktop Version**: 1.34493.1

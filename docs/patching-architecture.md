@@ -86,6 +86,87 @@ Patch 12 alone isn't sufficient for LOCAL mode — the CCD daemon also throws `U
 
 Together, patch 13 keeps Cowork (and any non-LOCAL feature that incidentally probes CCD) functional with no env var; patch 14 reactivates the LOCAL escape hatch for users who opt in via `claudeCodePackage`.
 
+## Linux deep-link delivery (patch 22)
+
+Fixes issues #52 and #57. Ported from PR #53 (thanks @stuckj) — renumbered from that
+PR's "20", which was taken by the Swift notification loader in the meantime, and
+re-anchored because the flake has since moved from a single `$INDEX` to anchor-based
+discovery.
+
+Through v1.9255.2 the main process branched on platform when wiring up deep links:
+
+```javascript
+isMac ? (app.on("open-url", …), app.on("continue-activity", …))
+      : app.requestSingleInstanceLock()
+          ? app.on("second-instance", (e, argv) => { focus(); dispatch(argv) })
+          : app.quit();
+```
+
+**v1.24012.9 dropped the non-darwin arm.** It now registers `open-url`,
+`will-continue-activity` and `continue-activity` unconditionally — and all three are
+macOS-only Electron events. `requestSingleInstanceLock` and `second-instance` are absent
+from the entire extracted tree, and there is no cold-start argv scan for the scheme.
+
+On Linux the consequences are:
+
+1. No single-instance lock, so every `claude-desktop claude://…` invocation (i.e. every
+   `xdg-open` of the scheme handler) starts a second full app against one
+   `--user-data-dir`.
+2. The URL sits unread in that process's argv, and is silently dropped.
+
+This breaks OAuth sign-in outright. The app hands off to the system browser — its
+in-process path, `ASWebAuthenticationSession`, is macOS-only — and the `claude://login/…`
+callback never gets back in. The user sees a new window still showing the login screen,
+with no way to ever complete sign-in. Both reporters independently confirmed the OS-level
+routing works (`xdg-open 'claude://test'` does reach the app), which is what makes this
+look like an OAuth-parameter bug rather than a delivery bug.
+
+`scripts/linux-deep-link.js` restores the missing arm. It deliberately does **not**
+reimplement dispatch — the app's own `open-url` listener already owns mainView readiness,
+the pending-URL stash for pre-ready arrivals, and window focus — so the patch just
+re-emits that event:
+
+```javascript
+app.emit("open-url", { preventDefault() {} }, url);
+```
+
+Keeping the app as the single owner of URL handling is what makes this cheap to carry
+across version bumps: the only structural assumption is that an `app.on("open-url")`
+listener exists, which the build-time assertion pins.
+
+### Details worth preserving if this is ever rewritten
+
+- **`app.exit(0)`, not `app.quit()`, for the losing instance.** The script is appended to
+  the end of `index.js`, so by then the app has registered its `before-quit`/`onQuitCleanup`
+  handlers, and `app.quit()` runs all of them — including `flush-web-storage` and
+  `plan-usage-history`, which write into the `--user-data-dir` the *primary* owns. A
+  process that should never have started must not touch shared state on its way out.
+- **The handoff is already done when the lock call returns.** Chromium's `ProcessSingleton`
+  notifies the primary and waits for the ack inside `requestSingleInstanceLock()`, so
+  exiting immediately afterwards loses nothing.
+- **The listener assertion must accept a backtick.** This build minifies every string
+  literal to a template literal, so the source reads ``app.on(`open-url`, …)``. PR #53's
+  assertion grepped for `app.on("open-url"` only and would have failed the build on
+  v1.34493.1 despite the listener being present.
+- **Append to `index.js`, not to whichever chunk holds the listener.** `index.js` is the
+  entry that requires every chunk, so appending there runs after the app's own listeners
+  exist but before `ready` — the only window in which `requestSingleInstanceLock()` is
+  still useful. Patch 01 appends to the same file for the same reason. Keying the append
+  to the chunk that happens to hold `open-url` would re-introduce exactly the
+  filename-coupling the anchor-based scheme exists to avoid.
+
+The second build assertion (`requestSingleInstanceLock` must be *absent* before appending)
+is a tripwire: if a future release restores the arm itself, the build fails loudly rather
+than installing two competing single-instance handlers.
+
+### Testing
+
+`tests/deep-link` drives two real Electron processes against the actual script. This
+cannot be covered by a headless launch: nothing crashes and no Sentry event fires, the
+damage is that a *second process starts*. See that directory's README, including the
+`CDT_SCRIPT_OVERRIDE` negative control — with the patch removed, three of its four
+assertions must fail.
+
 ## Wrapped-Electron Path Resolution Gotcha
 
 In a Nix build that wraps a stock Electron with `makeWrapper` and passes `app.asar` as a positional argument:
