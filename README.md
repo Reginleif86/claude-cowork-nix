@@ -3,8 +3,76 @@
 [![Nix Flake](https://img.shields.io/badge/Nix-Flake-5277C3?logo=nixos&logoColor=white)](https://github.com/Reginleif88/claude-cowork-nix)
 [![Platform](https://img.shields.io/badge/Platform-Linux-blue?logo=linux&logoColor=white)](https://github.com/Reginleif88/claude-cowork-nix)
 [![License](https://img.shields.io/badge/License-Apache--2.0%20OR%20MIT-blue)](./LICENSE-APACHE)
-[![Claude Desktop](https://img.shields.io/badge/Claude_Desktop-v1.32352.0-1dc8f7)](https://claude.ai)
+[![Claude Desktop](https://img.shields.io/badge/Claude_Desktop-v1.34493.1-1dc8f7)](https://claude.ai)
 [![Cowork](https://img.shields.io/badge/Cowork-Enabled-green)](./COWORK_PROGRESS.md)
+[![Status](https://img.shields.io/badge/Status-Sunset%20%E2%80%94%20use%20the%20official%20Linux%20client-orange)](https://code.claude.com/docs/en/desktop-linux)
+
+> [!IMPORTANT]
+> ## Anthropic now ships an official Claude Desktop for Linux — this repo is winding down
+>
+> When this project started, there was no Linux build of Claude Desktop at all. That is no
+> longer true. Anthropic ships an official Linux client, and it reached **version parity with
+> macOS** — both channels were at `1.34493.1` on 2026-08-24, released in lockstep.
+>
+> **If you are on Ubuntu 22.04+ or Debian 12+**, install it directly and stop using this repo:
+>
+> ```bash
+> sudo curl -fsSLo /usr/share/keyrings/claude-desktop-archive-keyring.asc \
+>   https://downloads.claude.ai/claude-desktop/key.asc
+> echo "deb [signed-by=/usr/share/keyrings/claude-desktop-archive-keyring.asc] \
+>   https://downloads.claude.ai/claude-desktop/apt/stable stable main" \
+>   | sudo tee /etc/apt/sources.list.d/claude-desktop.list
+> sudo apt update && sudo apt install claude-desktop
+> ```
+>
+> **If you are on NixOS**, use [`numtide/llm-agents.nix`](https://github.com/numtide/llm-agents.nix).
+> It packages the official `.deb` with `autoPatchelfHook`, covers `x86_64-linux` and
+> `aarch64-linux`, and is regenerated daily from Anthropic's APT index:
+>
+> ```nix
+> {
+>   inputs.llm-agents.url = "github:numtide/llm-agents.nix";
+>
+>   # NixOS
+>   environment.systemPackages = [ inputs.llm-agents.packages.${pkgs.system}.claude-desktop ];
+>   # or home-manager
+>   home.packages = [ inputs.llm-agents.packages.${pkgs.system}.claude-desktop ];
+> }
+> ```
+>
+> ### What you gain by switching
+>
+> This repo works by extracting Anthropic's **macOS** DMG and applying 22 patches to make a
+> macOS app behave on Linux. The official build simply *is* a Linux app, so an entire class of
+> breakage stops existing:
+>
+> | This repo patches around… | Official Linux build |
+> |---|---|
+> | a hand-written `@ant/claude-native` stub (patch 00) | ships a real `claude-native-binding.node` |
+> | overlaying a Linux `pty.node` (patch 18) | ships `prebuilds/linux-x64/pty.node` |
+> | restoring `claude://` deep links (patch 22) | has `requestSingleInstanceLock` + `second-instance` |
+> | bypassing the macOS `disclaimer` spawn helper (patch 19) | no such helper exists |
+> | guarding macOS-fork-only Electron APIs (patches 16–17) | never calls them |
+> | a bubblewrap Cowork shim (patches 03–06) | a real VM: `qemu-system-x86`, `ovmf`, `virtiofsd` |
+>
+> Cowork in particular gets a genuine VM instead of this repo's bubblewrap approximation.
+>
+> ### Migration note
+>
+> This repo ships `programs.claude-desktop` (`nixosModules.default` /
+> `homeManagerModules.default`). `llm-agents.nix` is packages-and-overlays only, with **no
+> equivalent module** — so drop the `programs.claude-desktop` block and place the package
+> directly, as shown above. If you set `claudeCodePackage`, note that Anthropic
+> [ships Linux `claude-code` builds](https://github.com/anthropics/claude-code) directly now,
+> so that override is generally no longer needed.
+>
+> ### Status of this repo
+>
+> `v1.34493.1` is the last planned DMG bump. Everything below still works and the flake stays
+> pinnable, but no further version bumps are planned. Filed issues may not get fixes — please
+> report Linux client bugs to Anthropic, and NixOS packaging bugs to `llm-agents.nix`.
+>
+> Thanks to everyone who reported issues and sent patches here over the last year.
 
 Fully declarative NixOS package for Claude Desktop on Linux with Cowork support. Extracts from the macOS DMG, patches for Linux compatibility, and wraps with Electron 41.
 
